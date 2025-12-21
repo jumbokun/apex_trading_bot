@@ -1,0 +1,96 @@
+# Apex Trading Bot 配置文件示例
+# 复制此文件为 config.yaml 并填入你的配置
+
+# API 配置
+api:
+  api_key: "your_api_key_here"
+  secret_key: "your_secret_key_here"
+  passphrase: "your_passphrase_here"
+  testnet: true  # true=测试网, false=主网
+
+# 运行模式
+mode:
+  dry_run: true  # true=模拟模式, false=实盘模式
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  scan_interval: 60  # 市场扫描间隔（秒）
+  save_state: true  # 是否保存状态
+  state_file: "trading_state.json"
+
+# 交易策略配置
+strategy:
+  # 交易对（可以配置多个）
+  symbols:
+    - "BTC-USDC"
+    # - "ETH-USDC"
+
+  # 时间框架
+  timeframe: "15m"  # 1m, 5m, 15m, 30m, 1h, 4h, 1d
+  kline_lookback: 100  # 回看K线数量
+
+  # 技术指标参数
+  indicators:
+    ma_short_period: 10  # 短期均线
+    ma_long_period: 30   # 长期均线
+    rsi_period: 14       # RSI周期
+    rsi_overbought: 70   # RSI超买阈值
+    rsi_oversold: 30     # RSI超卖阈值
+    volume_ma_period: 20 # 成交量均线周期
+    volume_surge_ratio: 1.5  # 成交量激增比率
+
+  # 信号确认
+  min_signal_strength: 0.6  # 最小信号强度 (0-1)
+
+  # 仓位管理
+  position:
+    initial_position_pct: 0.03  # 初始仓位占资金比例 (3%)
+    scale_in_pct: 0.02          # 加仓比例 (2%)
+    scale_out_pct: 0.5          # 减仓比例 (50%)
+
+# 风险控制配置
+risk:
+  # 仓位和杠杆限制
+  max_position_size: 0.10  # 最大仓位占比 (10%)
+  max_leverage: 3.0        # 最大杠杆倍数
+
+  # 止损止盈
+  stop_loss_pct: 0.02      # 止损百分比 (2%)
+  take_profit_pct: 0.05    # 止盈百分比 (5%)
+  trailing_stop_pct: 0.03  # 追踪止损百分比 (3%)
+
+  # 爆仓保护
+  min_margin_ratio: 0.15              # 最小保证金率 (15%)
+  emergency_close_margin_ratio: 0.20  # 紧急平仓保证金率 (20%)
+
+  # 每日限制
+  max_daily_loss_pct: 0.05  # 每日最大亏损 (5%)
+  max_daily_trades: 20      # 每日最大交易次数
+
+  # 市场过滤
+  max_volatility: 0.10      # 最大波动率 (10%)
+  min_volume_ratio: 0.5     # 最小成交量比率
+  max_funding_rate: 0.0005  # 最大资金费率 (0.05%)
+
+# 预设配置（取消注释使用）
+# preset: "safe"  # safe, balanced, aggressive
+
+# ============================================
+# 预设配置说明
+# ============================================
+# safe: 保守策略
+#   - 低杠杆 (2x)
+#   - 小仓位 (5%)
+#   - 严格止损 (1.5%)
+#   - 适合初学者
+#
+# balanced: 平衡策略
+#   - 中等杠杆 (3x)
+#   - 中等仓位 (10%)
+#   - 适中止损 (2%)
+#   - 适合有经验的交易者
+#
+# aggressive: 激进策略
+#   - 高杠杆 (5x)
+#   - 大仓位 (15%)
+#   - 宽松止损 (3%)
+#   - 高风险高收益
+# ============================================
