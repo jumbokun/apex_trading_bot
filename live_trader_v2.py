@@ -3,6 +3,9 @@ FOMO策略实盘交易器 V2
 使用官方apexomni SDK + OMNIKEY实现真实下单
 支持Apex Exchange主网
 
+数据源: Binance (更活跃的成交量数据)
+交易所: Apex Exchange (下单执行)
+
 安全特性:
 1. 启动前确认模式
 2. 最大持仓限制
@@ -15,6 +18,9 @@ FOMO策略实盘交易器 V2
 import os
 import sys
 import time
+import json
+import ssl
+import urllib.request
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -59,6 +65,44 @@ def load_env():
 
 
 load_env()
+
+
+def fetch_binance_klines(symbol: str, interval: str = "1m", limit: int = 100) -> List[dict]:
+    """
+    从Binance获取K线数据
+
+    Args:
+        symbol: 交易对 (如 BTC-USDT)
+        interval: K线间隔 (1m, 5m, 15m, 1h, etc.)
+        limit: 获取数量
+    """
+    # 转换交易对格式: BTC-USDT -> BTCUSDT, 1000PEPE-USDT -> PEPEUSDT
+    binance_symbol = symbol.replace("-", "")
+    if binance_symbol.startswith("1000"):
+        binance_symbol = binance_symbol[4:]
+
+    ssl_ctx = ssl.create_default_context()
+    url = f"https://api.binance.com/api/v3/klines?symbol={binance_symbol}&interval={interval}&limit={limit}"
+
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            klines = []
+            for k in data:
+                klines.append({
+                    "t": k[0],  # Open time
+                    "o": float(k[1]),
+                    "h": float(k[2]),
+                    "l": float(k[3]),
+                    "c": float(k[4]),
+                    "v": float(k[5]),
+                })
+            return klines
+    except Exception as e:
+        logger.error(f"获取Binance K线失败 {symbol}: {e}")
+        return []
+
 
 # 导入官方SDK
 try:
@@ -199,6 +243,42 @@ class ApexTraderV2:
             logger.error(f"获取Apex K线失败: {e}")
         return []
 
+    def _round_price_to_tick(self, price: float, symbol: str) -> float:
+        """将价格圆整到tickSize的倍数"""
+        try:
+            # 从configV3获取tickSize
+            if self.sign_client and hasattr(self.sign_client, 'configV3') and self.sign_client.configV3:
+                config = self.sign_client.configV3
+                contracts = config.get('contractConfig', {}).get('perpetualContract', [])
+                for c in contracts:
+                    if c.get('symbol') == symbol or c.get('symbolDisplayName') == symbol:
+                        tick_size = float(c.get('tickSize', 0.01))
+                        # 圆整到tickSize的倍数
+                        rounded = round(price / tick_size) * tick_size
+                        # 保留合适的小数位数
+                        decimals = len(str(tick_size).split('.')[-1]) if '.' in str(tick_size) else 0
+                        return round(rounded, decimals)
+        except Exception as e:
+            logger.warning(f"获取tickSize失败: {e}")
+        return price
+
+    def _round_size_to_step(self, size: float, symbol: str) -> float:
+        """将数量圆整到stepSize的倍数"""
+        try:
+            if self.sign_client and hasattr(self.sign_client, 'configV3') and self.sign_client.configV3:
+                config = self.sign_client.configV3
+                contracts = config.get('contractConfig', {}).get('perpetualContract', [])
+                for c in contracts:
+                    if c.get('symbol') == symbol or c.get('symbolDisplayName') == symbol:
+                        step_size = float(c.get('stepSize', 0.001))
+                        # 向下圆整到stepSize的倍数
+                        rounded = int(size / step_size) * step_size
+                        decimals = len(str(step_size).split('.')[-1]) if '.' in str(step_size) else 0
+                        return round(rounded, decimals)
+        except Exception as e:
+            logger.warning(f"获取stepSize失败: {e}")
+        return size
+
     def place_order(self, symbol: str, side: str, size: float,
                     price: float = None, order_type: str = "MARKET",
                     reduce_only: bool = False) -> dict:
@@ -208,6 +288,11 @@ class ApexTraderV2:
             return {"success": False, "error": "OMNIKEY未配置"}
 
         try:
+            # 圆整价格和数量
+            if price:
+                price = self._round_price_to_tick(price, symbol)
+            size = self._round_size_to_step(size, symbol)
+
             # 构建订单参数
             order_params = {
                 "symbol": symbol,
@@ -218,10 +303,27 @@ class ApexTraderV2:
                 "reduceOnly": reduce_only
             }
 
-            # 限价单需要价格
-            if order_type.upper() == "LIMIT" and price:
+            # apexomni SDK要求price参数，即使是MARKET单也需要
+            if price:
                 order_params["price"] = str(price)
+            else:
+                # 如果没有传price，尝试获取当前市场价
+                try:
+                    ticker = self.public_client.ticker_v3(symbol=symbol)
+                    if ticker.get("data"):
+                        ticker_data = ticker["data"]
+                        if isinstance(ticker_data, list):
+                            current_price = float(ticker_data[0].get("lastPrice", 0))
+                        else:
+                            current_price = float(ticker_data.get("lastPrice", 0))
+                        if current_price > 0:
+                            current_price = self._round_price_to_tick(current_price, symbol)
+                            order_params["price"] = str(current_price)
+                            logger.debug(f"MARKET单使用当前价格: {current_price}")
+                except Exception as e:
+                    logger.warning(f"获取ticker失败，尝试继续: {e}")
 
+            logger.debug(f"下单参数: {order_params}")
             result = self.sign_client.create_order_v3(**order_params)
 
             if result.get("data"):
@@ -238,12 +340,14 @@ class ApexTraderV2:
             logger.error(traceback.format_exc())
             return {"success": False, "error": str(e)}
 
-    def close_position(self, symbol: str, size: float, side: str = "SELL") -> dict:
+    def close_position(self, symbol: str, size: float, side: str = "SELL",
+                       price: float = None) -> dict:
         """平仓"""
         return self.place_order(
             symbol=symbol,
             side=side,
             size=size,
+            price=price,  # SDK需要price参数
             order_type="MARKET",
             reduce_only=True
         )
@@ -342,10 +446,11 @@ class LiveTraderV2:
         return True
 
     def update_klines(self, symbol: str) -> bool:
-        """更新K线数据"""
-        klines = self.trader.get_klines(symbol, "1", 100)
+        """更新K线数据 - 使用Binance数据源"""
+        # 使用Binance获取K线 (成交量数据更活跃)
+        klines = fetch_binance_klines(symbol, "1m", 100)
         if not klines:
-            logger.warning(f"无法获取{symbol}的K线数据")
+            logger.warning(f"无法获取{symbol}的Binance K线数据")
             return False
 
         strategy = self.strategies[symbol]
@@ -370,6 +475,21 @@ class LiveTraderV2:
 
         return True
 
+    def _get_apex_price(self, symbol: str) -> Optional[float]:
+        """获取Apex当前价格用于下单"""
+        ticker = self.trader.get_ticker(symbol)
+        if ticker:
+            return float(ticker.get("lastPrice", 0))
+        return None
+
+    def _count_open_positions(self) -> int:
+        """统计当前持仓数量"""
+        count = 0
+        for strategy in self.strategies.values():
+            if strategy.position is not None:
+                count += 1
+        return count
+
     def process_signal(self, symbol: str, signal: Signal):
         """处理交易信号 (支持多空双向)"""
         if signal.action == "NONE":
@@ -377,21 +497,36 @@ class LiveTraderV2:
 
         logger.info(f"[{symbol}] 信号: {signal.action} - {signal.reason}")
 
+        # 检查最大持仓数限制 (仅对开仓信号)
+        if signal.action in ["OPEN_LONG", "OPEN_SHORT"]:
+            current_positions = self._count_open_positions()
+            max_positions = self.strategies[symbol].config.max_positions
+            if current_positions >= max_positions:
+                logger.warning(f"[{symbol}] 跳过开仓: 已达最大持仓数 {current_positions}/{max_positions}")
+                return
+
+        # 获取Apex实时价格用于下单 (信号来自Binance，但下单在Apex执行)
+        apex_price = self._get_apex_price(symbol)
+        if not apex_price:
+            logger.warning(f"[{symbol}] 无法获取Apex价格，使用信号价格")
+            apex_price = signal.price
+
         if signal.action == "OPEN_LONG":
             if self.dry_run:
-                logger.info(f"[模拟] 开多 {symbol}: {signal.quantity:.6f} @ {signal.price:.2f}")
+                logger.info(f"[模拟] 开多 {symbol}: {signal.quantity:.6f} @ {apex_price:.2f}")
                 logger.info(f"[模拟] 止损: {signal.stop_price:.2f}")
             else:
                 result = self.trader.place_order(
                     symbol=symbol,
                     side="BUY",
                     size=signal.quantity,
+                    price=apex_price,  # 使用Apex价格
                     order_type="MARKET"
                 )
                 if result.get("success"):
                     logger.info(f"开多成功: {result}")
                     self.strategies[symbol].on_trade_executed(
-                        symbol, "OPEN_LONG", signal.price, signal.quantity,
+                        symbol, "OPEN_LONG", apex_price, signal.quantity,
                         datetime.now()
                     )
                 else:
@@ -399,19 +534,20 @@ class LiveTraderV2:
 
         elif signal.action == "OPEN_SHORT":
             if self.dry_run:
-                logger.info(f"[模拟] 开空 {symbol}: {signal.quantity:.6f} @ {signal.price:.2f}")
+                logger.info(f"[模拟] 开空 {symbol}: {signal.quantity:.6f} @ {apex_price:.2f}")
                 logger.info(f"[模拟] 止损: {signal.stop_price:.2f}")
             else:
                 result = self.trader.place_order(
                     symbol=symbol,
                     side="SELL",
                     size=signal.quantity,
+                    price=apex_price,  # 使用Apex价格
                     order_type="MARKET"
                 )
                 if result.get("success"):
                     logger.info(f"开空成功: {result}")
                     self.strategies[symbol].on_trade_executed(
-                        symbol, "OPEN_SHORT", signal.price, signal.quantity,
+                        symbol, "OPEN_SHORT", apex_price, signal.quantity,
                         datetime.now()
                     )
                 else:
@@ -425,12 +561,13 @@ class LiveTraderV2:
                 side_text = "平多" if strategy.position.side == "LONG" else "平空"
 
                 if self.dry_run:
-                    logger.info(f"[模拟] {side_text} {symbol}: {strategy.position.quantity:.6f} @ {signal.price:.2f}")
+                    logger.info(f"[模拟] {side_text} {symbol}: {strategy.position.quantity:.6f} @ {apex_price:.2f}")
                 else:
                     result = self.trader.close_position(
                         symbol=symbol,
                         size=strategy.position.quantity,
-                        side=close_side
+                        side=close_side,
+                        price=apex_price  # 使用Apex价格
                     )
                     if result.get("success"):
                         logger.info(f"{side_text}成功: {result}")
@@ -443,32 +580,25 @@ class LiveTraderV2:
 
     def run_once(self):
         """运行一次检查"""
-        logger.info(f"--- 开始检查 ({datetime.now().strftime('%H:%M:%S')}) ---")
+        logger.debug(f"--- 开始检查 ({datetime.now().strftime('%H:%M:%S')}) ---")
         for symbol in self.symbols:
             try:
-                logger.info(f"[{symbol}] 获取K线数据...")
                 # 更新数据
                 if not self.update_klines(symbol):
                     continue
 
-                logger.info(f"[{symbol}] 生成信号...")
                 # 生成信号
                 signal = self.strategies[symbol].generate_signal(symbol)
 
                 # 处理信号
                 self.process_signal(symbol, signal)
 
-                # 输出状态
+                # 只输出持仓状态（重要信息）
                 status = self.strategies[symbol].get_status()
                 if status["has_position"]:
                     pos = status["position"]
                     logger.info(f"[{symbol}] 持仓中: {pos['quantity']:.6f} @ {pos['entry_price']:.2f}, "
                                f"止损: {pos['stop_price']:.2f}, 追踪: {pos['trail_stop']}")
-                else:
-                    # 显示当前价格
-                    if len(self.strategies[symbol].closes) > 0:
-                        current_price = self.strategies[symbol].closes[-1]
-                        logger.info(f"[{symbol}] 当前价格: {current_price:.2f}, 信号: {signal.reason}")
 
             except Exception as e:
                 logger.error(f"处理{symbol}时出错: {e}")
@@ -505,9 +635,19 @@ class LiveTraderV2:
         logger.info(f"开始运行，检查间隔: {interval_seconds}秒")
         logger.info("按 Ctrl+C 停止")
 
+        heartbeat_interval = 3  # 每3分钟输出一次心跳
+        loop_count = 0
+
         try:
             while self.running:
                 self.run_once()
+                loop_count += 1
+
+                # 每3分钟输出心跳状态
+                if loop_count % heartbeat_interval == 0:
+                    positions = sum(1 for s in self.symbols if self.strategies[s].get_status()["has_position"])
+                    logger.info(f"[心跳] 运行中 | 扫描{len(self.symbols)}币种 | 当前持仓: {positions}个")
+
                 time.sleep(interval_seconds)
 
         except KeyboardInterrupt:
@@ -527,26 +667,24 @@ class LiveTraderV2:
 
 def main():
     """主函数"""
-    # 配置 - 使用USDT交易对 (日均交易量>$5M的高流动性品种)
+    # 配置 - Binance和Apex都有的交易对 (移除Apex特有的新币)
     SYMBOLS = [
         # 主流币 (最高流动性)
         "BTC-USDT", "ETH-USDT", "SOL-USDT",
         # 大盘币
         "AAVE-USDT", "LINK-USDT", "UNI-USDT", "BCH-USDT", "LTC-USDT",
         "NEAR-USDT", "APT-USDT", "INJ-USDT", "ARB-USDT", "OP-USDT",
-        # Meme币 (高波动)
-        "1000PEPE-USDT", "1000BONK-USDT", "WIF-USDT", "PENGU-USDT",
-        "MOODENG-USDT", "FARTCOIN-USDT",  # GOAT-USDT removed (no liquidity on Apex)
+        # Meme币 (高波动) - Binance用PEPE/BONK不带1000前缀，但代码会自动转换
+        "1000PEPE-USDT", "1000BONK-USDT", "WIF-USDT",
         # DeFi
         "PENDLE-USDT", "CRV-USDT", "LDO-USDT", "JUP-USDT", "ENA-USDT",
         # L2/基础设施
-        "ZK-USDT", "STX-USDT", "TIA-USDT", "EIGEN-USDT",
-        # 热门新币
-        "HYPE-USDT", "VIRTUAL-USDT", "IP-USDT", "0G-USDT", "M-USDT",
-        "KAITO-USDT", "LAYER-USDT",
-        # 其他高交易量
-        "ACT-USDT", "ORDI-USDT", "WLD-USDT", "AR-USDT", "RENDER-USDT",
-        "ZEN-USDT", "HBAR-USDT", "ENS-USDT", "MNT-USDT", "CAKE-USDT",
+        "STX-USDT", "TIA-USDT", "EIGEN-USDT",
+        # 其他高交易量 (Binance都有)
+        "ORDI-USDT", "WLD-USDT", "AR-USDT", "RENDER-USDT",
+        "ZEN-USDT", "HBAR-USDT", "ENS-USDT", "CAKE-USDT",
+        # 主流补充
+        "DOGE-USDT", "XRP-USDT", "ADA-USDT", "AVAX-USDT", "DOT-USDT",
     ]
     TESTNET = os.getenv("APEX_TESTNET", "true").lower() == "true"
     DRY_RUN = False  # 实盘交易
@@ -557,7 +695,8 @@ def main():
     print(f"网络: {'测试网' if TESTNET else '主网'}")
     print(f"模式: {'模拟运行' if DRY_RUN else '实盘交易'}")
     print(f"交易对: {SYMBOLS}")
-    print(f"价格源: Apex Exchange")
+    print(f"K线数据: Binance (成交量更活跃)")
+    print(f"交易执行: Apex Exchange")
     print("=" * 50)
 
     if not TESTNET and not DRY_RUN:

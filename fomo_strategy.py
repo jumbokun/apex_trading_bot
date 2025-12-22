@@ -49,14 +49,20 @@ class FOMOStrategyConfig:
     enable_trail_after_R: float = 3.0  # 启用追踪的R倍数 - 从1.5优化到3.0
 
     # 杠杆
-    leverage_min: int = 2
-    leverage_max: int = 5
+    leverage_min: int = 5
+    leverage_max: int = 20
 
     # 风控
     daily_loss_limit: float = 150.0  # 每日亏损限额
     max_consecutive_losses: int = 5  # 最大连续亏损次数
     cooldown_minutes: int = 30  # 亏损后冷却时间(分钟)
     symbol_cooldown_minutes: int = 60  # 同品种冷却时间
+    max_positions: int =  10  # 最大同时持仓数
+
+    # 波动率调整仓位
+    # 低波动率(止损<2%) -> 较大仓位, 高波动率(止损>4%) -> 较小仓位
+    notional_min: float = 500.0  # 最小名义价值
+    notional_max: float = 2500.0  # 最大名义价值 (降低风险)
 
     # 执行
     commission_rate: float = 0.0006  # 手续费率
@@ -367,9 +373,16 @@ class FOMOStrategy:
         if stop_pct >= self.config.stop_pct_max:
             return Signal(symbol=symbol, action="NONE", price=0, reason="波动率过高")
 
+        # 根据波动率调整仓位大小
+        # 低波动率(1%) -> 最大仓位, 高波动率(6%) -> 最小仓位
+        # 线性插值: notional = max - (stop_pct - min) / (max - min) * (notional_max - notional_min)
+        vol_range = self.config.stop_pct_max - self.config.stop_pct_min
+        vol_ratio_normalized = (stop_pct - self.config.stop_pct_min) / vol_range
+        notional = self.config.notional_max - vol_ratio_normalized * (self.config.notional_max - self.config.notional_min)
+        notional = max(self.config.notional_min, min(notional, self.config.notional_max))
+
         # 检查保证金
         leverage = self._calculate_leverage(stop_pct)
-        notional = self.config.risk_per_trade / stop_pct
         required_margin = notional / leverage
         if required_margin > self.capital * 0.5:
             return Signal(symbol=symbol, action="NONE", price=0, reason="资金不足")
