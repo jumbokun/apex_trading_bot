@@ -1,6 +1,6 @@
 """
 FOMO策略实盘交易器 V2
-使用官方apexomni SDK
+使用官方apexomni SDK + OMNIKEY实现真实下单
 支持Apex Exchange主网
 
 安全特性:
@@ -21,7 +21,10 @@ from typing import Dict, List, Optional
 
 from fomo_strategy import FOMOStrategy, FOMOStrategyConfig, Signal
 
-# 设置日志 - 强制立即刷新
+# 设置日志 - 强制立即刷新，保存到项目目录
+LOG_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(LOG_DIR, 'trading.log')
+
 class FlushFileHandler(logging.FileHandler):
     def emit(self, record):
         super().emit(record)
@@ -36,7 +39,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        FlushFileHandler('trading.log', encoding='utf-8'),
+        FlushFileHandler(LOG_FILE, encoding='utf-8'),
         FlushStreamHandler()
     ]
 )
@@ -61,60 +64,25 @@ load_env()
 try:
     from apexomni.http_public import HttpPublic
     from apexomni.http_private import HttpPrivate
+    from apexomni.http_private_sign import HttpPrivateSign
     SDK_AVAILABLE = True
 except ImportError:
     SDK_AVAILABLE = False
     logger.warning("apexomni SDK not found. Install with: pip install apexomni")
 
 
-# 使用Binance获取K线数据（因为Apex公共API不稳定）
-import urllib.request
-import json
-import ssl
-
-
-def get_binance_klines(symbol: str, interval: str = "1m", limit: int = 100) -> List[dict]:
-    """从Binance获取K线数据"""
-    # 转换交易对格式: BTC-USDC -> BTCUSDC
-    binance_symbol = symbol.replace("-", "")
-    if binance_symbol.endswith("USDC"):
-        binance_symbol = binance_symbol[:-4] + "USDT"  # Binance没有USDC对，用USDT
-
-    url = f"https://api.binance.com/api/v3/klines?symbol={binance_symbol}&interval={interval}&limit={limit}"
-
-    ssl_ctx = ssl.create_default_context()
-    req = urllib.request.Request(url)
-
-    try:
-        with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-            klines = []
-            for k in data:
-                klines.append({
-                    "t": k[0],  # Open time
-                    "o": k[1],  # Open
-                    "h": k[2],  # High
-                    "l": k[3],  # Low
-                    "c": k[4],  # Close
-                    "v": k[5],  # Volume
-                })
-            return klines
-    except Exception as e:
-        logger.error(f"获取Binance K线失败: {e}")
-        return []
-
-
 class ApexTraderV2:
-    """Apex Exchange交易接口 - 使用官方SDK"""
+    """Apex Exchange交易接口 - 使用官方SDK + OMNIKEY"""
 
     NETWORK_ID_MAINNET = 42161  # Arbitrum mainnet
     NETWORK_ID_TESTNET = 421614  # Arbitrum Sepolia
 
     def __init__(self, api_key: str, secret_key: str, passphrase: str,
-                 testnet: bool = True):
+                 omnikey: str = "", testnet: bool = True):
         self.api_key = api_key
         self.secret_key = secret_key
         self.passphrase = passphrase
+        self.omnikey = omnikey
         self.testnet = testnet
 
         if testnet:
@@ -124,8 +92,10 @@ class ApexTraderV2:
             self.endpoint = "https://omni.apex.exchange"
             self.network_id = self.NETWORK_ID_MAINNET
 
-        # 初始化客户端
+        # 初始化公共客户端
         self.public_client = HttpPublic(self.endpoint)
+
+        # 初始化私有客户端 (用于查询)
         self.private_client = HttpPrivate(
             self.endpoint,
             network_id=self.network_id,
@@ -136,11 +106,36 @@ class ApexTraderV2:
             }
         )
 
+        # 初始化签名客户端 (用于下单) - 使用OMNIKEY
+        self.sign_client = None
+        if omnikey:
+            try:
+                self.sign_client = HttpPrivateSign(
+                    self.endpoint,
+                    network_id=self.network_id,
+                    zk_seeds=omnikey,
+                    zk_l2Key=omnikey,
+                    api_key_credentials={
+                        'key': api_key,
+                        'secret': secret_key,
+                        'passphrase': passphrase
+                    }
+                )
+                # 加载配置（下单前需要）
+                self.sign_client.configs_v3()
+                logger.info("OMNIKEY签名客户端初始化成功")
+            except Exception as e:
+                logger.error(f"OMNIKEY签名客户端初始化失败: {e}")
+                self.sign_client = None
+
     def get_account(self) -> dict:
         """获取账户信息"""
         try:
-            result = self.private_client.get_account_v2()
-            return {"success": True, "data": result.get("data", {})}
+            if self.sign_client:
+                result = self.sign_client.get_account_v3()
+            else:
+                result = self.private_client.get_account_v2()
+            return {"success": True, "data": result}
         except Exception as e:
             logger.error(f"获取账户失败: {e}")
             return {"success": False, "error": str(e)}
@@ -149,13 +144,14 @@ class ApexTraderV2:
         """获取持仓"""
         result = self.get_account()
         if result.get("success"):
-            positions = result.get("data", {}).get("positions", [])
+            data = result.get("data", {})
+            positions = data.get("positions", [])
             if positions:
                 return [p for p in positions if float(p.get("size", 0)) != 0]
         return []
 
     def get_ticker(self, symbol: str) -> Optional[dict]:
-        """获取行情"""
+        """获取行情 - 使用Apex数据"""
         try:
             result = self.public_client.ticker_v3(symbol=symbol)
             if result.get("data"):
@@ -168,19 +164,101 @@ class ApexTraderV2:
 
     def get_klines(self, symbol: str, interval: str = "1",
                    limit: int = 100) -> List[dict]:
-        """获取K线 - 使用Binance数据"""
-        return get_binance_klines(symbol, f"{interval}m", limit)
+        """获取K线 - 使用Apex数据"""
+        try:
+            # Apex kline API: interval为分钟数
+            result = self.public_client.klines_v3(
+                symbol=symbol,
+                interval=interval,
+                limit=limit
+            )
+            if result.get("data"):
+                # Apex格式: {'data': {'BTCUSDT': [...]}}
+                # symbol格式转换: BTC-USDT -> BTCUSDT
+                apex_symbol = symbol.replace("-", "")
+                data = result.get("data", {})
+
+                # data可能是dict或list
+                if isinstance(data, dict):
+                    kline_list = data.get(apex_symbol, [])
+                else:
+                    kline_list = data
+
+                klines = []
+                for k in kline_list:
+                    klines.append({
+                        "t": k.get("t", 0),  # Open time
+                        "o": k.get("o", "0"),  # Open
+                        "h": k.get("h", "0"),  # High
+                        "l": k.get("l", "0"),  # Low
+                        "c": k.get("c", "0"),  # Close
+                        "v": k.get("v", "0"),  # Volume
+                    })
+                return klines
+        except Exception as e:
+            logger.error(f"获取Apex K线失败: {e}")
+        return []
 
     def place_order(self, symbol: str, side: str, size: float,
                     price: float = None, order_type: str = "MARKET",
                     reduce_only: bool = False) -> dict:
-        """下单 - 需要ZK签名，暂时只支持模拟"""
-        logger.warning("实际下单需要ZK签名，当前版本暂不支持")
-        return {"success": False, "error": "ZK签名未配置"}
+        """下单 - 使用OMNIKEY签名"""
+        if not self.sign_client:
+            logger.error("OMNIKEY未配置，无法下单")
+            return {"success": False, "error": "OMNIKEY未配置"}
 
-    def close_position(self, symbol: str, size: float) -> dict:
+        try:
+            # 构建订单参数
+            order_params = {
+                "symbol": symbol,
+                "side": side.upper(),
+                "type": order_type.upper(),
+                "size": str(size),
+                "timestampSeconds": time.time(),
+                "reduceOnly": reduce_only
+            }
+
+            # 限价单需要价格
+            if order_type.upper() == "LIMIT" and price:
+                order_params["price"] = str(price)
+
+            result = self.sign_client.create_order_v3(**order_params)
+
+            if result.get("data"):
+                order_id = result.get("data", {}).get("orderId")
+                logger.info(f"下单成功: {order_id}")
+                return {"success": True, "data": result.get("data")}
+            else:
+                logger.error(f"下单失败: {result}")
+                return {"success": False, "error": str(result)}
+
+        except Exception as e:
+            logger.error(f"下单异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "error": str(e)}
+
+    def close_position(self, symbol: str, size: float, side: str = "SELL") -> dict:
         """平仓"""
-        return self.place_order(symbol, "SELL", size, reduce_only=True)
+        return self.place_order(
+            symbol=symbol,
+            side=side,
+            size=size,
+            order_type="MARKET",
+            reduce_only=True
+        )
+
+    def cancel_order(self, order_id: str) -> dict:
+        """取消订单"""
+        if not self.sign_client:
+            return {"success": False, "error": "OMNIKEY未配置"}
+
+        try:
+            result = self.sign_client.delete_order_v3(id=order_id)
+            return {"success": True, "data": result}
+        except Exception as e:
+            logger.error(f"取消订单失败: {e}")
+            return {"success": False, "error": str(e)}
 
 
 class LiveTraderV2:
@@ -188,7 +266,7 @@ class LiveTraderV2:
     实盘交易器 V2
 
     使用方法:
-    1. 配置.env文件中的API密钥
+    1. 配置.env文件中的API密钥和OMNIKEY
     2. 设置APEX_TESTNET=false使用主网
     3. 运行 py -3.12 live_trader_v2.py
     """
@@ -211,14 +289,19 @@ class LiveTraderV2:
         self.api_key = os.getenv("APEX_API_KEY", "")
         self.secret_key = os.getenv("APEX_SECRET_KEY", "")
         self.passphrase = os.getenv("APEX_PASSPHRASE", "")
+        self.omnikey = os.getenv("OMNIKEY", "")
 
         if not all([self.api_key, self.secret_key, self.passphrase]):
             raise ValueError("请在.env中配置APEX_API_KEY, APEX_SECRET_KEY, APEX_PASSPHRASE")
 
+        if not dry_run and not self.omnikey:
+            raise ValueError("实盘交易需要在.env中配置OMNIKEY")
+
         # 初始化交易接口
         if SDK_AVAILABLE:
             self.trader = ApexTraderV2(
-                self.api_key, self.secret_key, self.passphrase, testnet
+                self.api_key, self.secret_key, self.passphrase,
+                omnikey=self.omnikey, testnet=testnet
             )
         else:
             raise RuntimeError("apexomni SDK未安装，请运行: pip install apexomni")
@@ -288,7 +371,7 @@ class LiveTraderV2:
         return True
 
     def process_signal(self, symbol: str, signal: Signal):
-        """处理交易信号"""
+        """处理交易信号 (支持多空双向)"""
         if signal.action == "NONE":
             return
 
@@ -306,32 +389,57 @@ class LiveTraderV2:
                     order_type="MARKET"
                 )
                 if result.get("success"):
-                    logger.info(f"开仓成功: {result}")
+                    logger.info(f"开多成功: {result}")
                     self.strategies[symbol].on_trade_executed(
                         symbol, "OPEN_LONG", signal.price, signal.quantity,
                         datetime.now()
                     )
                 else:
-                    logger.error(f"开仓失败: {result}")
+                    logger.error(f"开多失败: {result}")
+
+        elif signal.action == "OPEN_SHORT":
+            if self.dry_run:
+                logger.info(f"[模拟] 开空 {symbol}: {signal.quantity:.6f} @ {signal.price:.2f}")
+                logger.info(f"[模拟] 止损: {signal.stop_price:.2f}")
+            else:
+                result = self.trader.place_order(
+                    symbol=symbol,
+                    side="SELL",
+                    size=signal.quantity,
+                    order_type="MARKET"
+                )
+                if result.get("success"):
+                    logger.info(f"开空成功: {result}")
+                    self.strategies[symbol].on_trade_executed(
+                        symbol, "OPEN_SHORT", signal.price, signal.quantity,
+                        datetime.now()
+                    )
+                else:
+                    logger.error(f"开空失败: {result}")
 
         elif signal.action == "CLOSE":
             strategy = self.strategies[symbol]
             if strategy.position:
+                # 根据持仓方向决定平仓方向
+                close_side = "SELL" if strategy.position.side == "LONG" else "BUY"
+                side_text = "平多" if strategy.position.side == "LONG" else "平空"
+
                 if self.dry_run:
-                    logger.info(f"[模拟] 平仓 {symbol}: {strategy.position.quantity:.6f} @ {signal.price:.2f}")
+                    logger.info(f"[模拟] {side_text} {symbol}: {strategy.position.quantity:.6f} @ {signal.price:.2f}")
                 else:
                     result = self.trader.close_position(
                         symbol=symbol,
-                        size=strategy.position.quantity
+                        size=strategy.position.quantity,
+                        side=close_side
                     )
                     if result.get("success"):
-                        logger.info(f"平仓成功: {result}")
+                        logger.info(f"{side_text}成功: {result}")
                         strategy.on_trade_executed(
                             symbol, "CLOSE", signal.price,
                             strategy.position.quantity, datetime.now()
                         )
                     else:
-                        logger.error(f"平仓失败: {result}")
+                        logger.error(f"{side_text}失败: {result}")
 
     def run_once(self):
         """运行一次检查"""
@@ -419,10 +527,29 @@ class LiveTraderV2:
 
 def main():
     """主函数"""
-    # 配置
-    SYMBOLS = ["BTC-USDC", "ETH-USDC"]  # 交易对
+    # 配置 - 使用USDT交易对 (日均交易量>$5M的高流动性品种)
+    SYMBOLS = [
+        # 主流币 (最高流动性)
+        "BTC-USDT", "ETH-USDT", "SOL-USDT",
+        # 大盘币
+        "AAVE-USDT", "LINK-USDT", "UNI-USDT", "BCH-USDT", "LTC-USDT",
+        "NEAR-USDT", "APT-USDT", "INJ-USDT", "ARB-USDT", "OP-USDT",
+        # Meme币 (高波动)
+        "1000PEPE-USDT", "1000BONK-USDT", "WIF-USDT", "PENGU-USDT",
+        "MOODENG-USDT", "FARTCOIN-USDT", "GOAT-USDT",
+        # DeFi
+        "PENDLE-USDT", "CRV-USDT", "LDO-USDT", "JUP-USDT", "ENA-USDT",
+        # L2/基础设施
+        "ZK-USDT", "STX-USDT", "TIA-USDT", "EIGEN-USDT",
+        # 热门新币
+        "HYPE-USDT", "VIRTUAL-USDT", "IP-USDT", "0G-USDT", "M-USDT",
+        "KAITO-USDT", "LAYER-USDT",
+        # 其他高交易量
+        "ACT-USDT", "ORDI-USDT", "WLD-USDT", "AR-USDT", "RENDER-USDT",
+        "ZEN-USDT", "HBAR-USDT", "ENS-USDT", "MNT-USDT", "CAKE-USDT",
+    ]
     TESTNET = os.getenv("APEX_TESTNET", "true").lower() == "true"
-    DRY_RUN = True  # 设为False进行实盘交易
+    DRY_RUN = False  # 实盘交易
 
     print("=" * 50)
     print("FOMO策略实盘交易器 V2")
@@ -430,13 +557,14 @@ def main():
     print(f"网络: {'测试网' if TESTNET else '主网'}")
     print(f"模式: {'模拟运行' if DRY_RUN else '实盘交易'}")
     print(f"交易对: {SYMBOLS}")
+    print(f"价格源: Apex Exchange")
     print("=" * 50)
 
     if not TESTNET and not DRY_RUN:
         print("\n警告: 主网实盘交易模式!")
         print("请确保:")
-        print("1. API密钥配置正确")
-        print("2. 账户有足够资金")
+        print("1. API密钥和OMNIKEY配置正确")
+        print("2. 账户有足够资金 (USDT)")
         print("3. 已了解策略风险")
         print()
 
