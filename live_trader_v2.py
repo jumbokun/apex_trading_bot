@@ -536,7 +536,7 @@ def main():
         "NEAR-USDT", "APT-USDT", "INJ-USDT", "ARB-USDT", "OP-USDT",
         # Meme币 (高波动)
         "1000PEPE-USDT", "1000BONK-USDT", "WIF-USDT", "PENGU-USDT",
-        "MOODENG-USDT", "FARTCOIN-USDT", "GOAT-USDT",
+        "MOODENG-USDT", "FARTCOIN-USDT",  # GOAT-USDT removed (no liquidity on Apex)
         # DeFi
         "PENDLE-USDT", "CRV-USDT", "LDO-USDT", "JUP-USDT", "ENA-USDT",
         # L2/基础设施
