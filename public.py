@@ -159,3 +159,4 @@ class PublicAPI:
         
         return self.client.get("/v3/public/funding-rate-history", params)
 
+

@@ -299,3 +299,4 @@ class TradeAPI:
         
         return self.client.get("/v3/order/worst-price", params)
 
+
