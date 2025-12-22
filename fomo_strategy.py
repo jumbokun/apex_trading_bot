@@ -1,12 +1,13 @@
 """
-FOMO策略 - 正式版本
+FOMO策略 - 正式版本 (支持双向交易)
 基于优化结果的最佳参数配置
 
 核心逻辑:
-1. 突破入场: 价格突破60根K线高点 + 成交量2倍确认
-2. ATR止损: 1.5倍ATR止损
-3. 追踪止盈: 盈利达到1.5R后启用5倍ATR追踪止损
-4. 无时间止损: 让趋势充分发展
+1. 向上突破入场: 价格突破60根K线高点 + 成交量2倍确认 -> 开多
+2. 向下突破入场: 价格跌破60根K线低点 + 成交量2倍确认 -> 开空
+3. ATR止损: 1.5倍ATR止损
+4. 追踪止盈: 盈利达到1.5R后启用5倍ATR追踪止损
+5. 无时间止损: 让趋势充分发展
 
 风险控制:
 - 每笔交易最大亏损50U
@@ -21,11 +22,15 @@ import numpy as np
 
 @dataclass
 class FOMOStrategyConfig:
-    """FOMO策略配置 - 优化后的最佳参数"""
+    """FOMO策略配置 - 参数优化后(14天回测+815U)"""
 
     # 资金管理
     initial_capital: float = 5000.0
     risk_per_trade: float = 50.0  # 每笔交易最大风险
+
+    # 交易方向
+    enable_long: bool = True  # 是否允许做多
+    enable_short: bool = False  # 是否允许做空 (默认关闭，回测显示空头表现差)
 
     # 入场条件
     breakout_lookback: int = 60  # 突破回看周期
@@ -39,9 +44,9 @@ class FOMOStrategyConfig:
     stop_pct_min: float = 0.01  # 最小止损百分比
     stop_pct_max: float = 0.06  # 最大止损百分比
 
-    # 追踪止损
-    trail_k_atr: float = 5.0  # 追踪止损距离(ATR倍数)
-    enable_trail_after_R: float = 1.5  # 启用追踪的R倍数
+    # 追踪止损 - 优化后参数
+    trail_k_atr: float = 7.0  # 追踪止损距离(ATR倍数) - 从5.0优化到7.0
+    enable_trail_after_R: float = 3.0  # 启用追踪的R倍数 - 从1.5优化到3.0
 
     # 杠杆
     leverage_min: int = 2
@@ -62,13 +67,14 @@ class FOMOStrategyConfig:
 class Position:
     """持仓信息"""
     symbol: str
-    side: str  # "LONG"
+    side: str  # "LONG" or "SHORT"
     entry_price: float
     avg_price: float
     quantity: float
     stop_price: float
-    R_value: float  # 1R = entry - stop
-    highest_price: float
+    R_value: float  # 1R = |entry - stop|
+    highest_price: float  # 多头用
+    lowest_price: float = 0.0  # 空头用
     trail_stop: Optional[float] = None
     trail_enabled: bool = False
     entry_time: datetime = None
@@ -79,11 +85,12 @@ class Position:
 class Signal:
     """交易信号"""
     symbol: str
-    action: str  # "OPEN_LONG", "CLOSE", "NONE"
+    action: str  # "OPEN_LONG", "OPEN_SHORT", "CLOSE", "NONE"
     price: float
     stop_price: float = 0.0
     quantity: float = 0.0
     reason: str = ""
+    side: str = ""  # "BUY" or "SELL" for exchange API
 
 
 class TechnicalAnalysis:
@@ -116,6 +123,13 @@ class TechnicalAnalysis:
         if len(data) < period:
             return max(data) if data else 0
         return max(data[-period:])
+
+    @staticmethod
+    def get_lowest(data: List[float], period: int) -> float:
+        """获取最低值"""
+        if len(data) < period:
+            return min(data) if data else float('inf')
+        return min(data[-period:])
 
     @staticmethod
     def get_volume_ratio(volumes: List[float], current_idx: int,
@@ -224,47 +238,87 @@ class FOMOStrategy:
 
     def _manage_position(self, symbol: str, price: float, high: float,
                          low: float, atr: float) -> Signal:
-        """管理现有持仓"""
+        """管理现有持仓 (支持多头和空头)"""
         pos = self.position
 
-        # 更新最高价
-        if high > pos.highest_price:
-            pos.highest_price = high
+        if pos.side == "LONG":
+            # ===== 多头管理 =====
+            # 更新最高价
+            if high > pos.highest_price:
+                pos.highest_price = high
 
-        # 计算当前盈亏R倍数
-        profit_R = (price - pos.entry_price) / pos.R_value
+            # 计算当前盈亏R倍数
+            profit_R = (price - pos.entry_price) / pos.R_value
 
-        # 启用追踪止损
-        if not pos.trail_enabled and profit_R >= self.config.enable_trail_after_R:
-            pos.trail_enabled = True
-            pos.trail_stop = pos.highest_price - self.config.trail_k_atr * atr
+            # 启用追踪止损
+            if not pos.trail_enabled and profit_R >= self.config.enable_trail_after_R:
+                pos.trail_enabled = True
+                pos.trail_stop = pos.highest_price - self.config.trail_k_atr * atr
 
-        # 更新追踪止损
-        if pos.trail_enabled:
-            new_trail = pos.highest_price - self.config.trail_k_atr * atr
-            if pos.trail_stop is None or new_trail > pos.trail_stop:
-                pos.trail_stop = new_trail
+            # 更新追踪止损
+            if pos.trail_enabled:
+                new_trail = pos.highest_price - self.config.trail_k_atr * atr
+                if pos.trail_stop is None or new_trail > pos.trail_stop:
+                    pos.trail_stop = new_trail
 
-        # 确定有效止损价
-        effective_stop = pos.stop_price
-        if pos.trail_stop and pos.trail_stop > effective_stop:
-            effective_stop = pos.trail_stop
+            # 确定有效止损价
+            effective_stop = pos.stop_price
+            if pos.trail_stop and pos.trail_stop > effective_stop:
+                effective_stop = pos.trail_stop
 
-        # 检查是否触发止损
-        if low <= effective_stop:
-            reason = "追踪止损" if pos.trail_enabled else "止损"
-            return Signal(
-                symbol=symbol,
-                action="CLOSE",
-                price=effective_stop,
-                reason=f"{reason} @ {effective_stop:.2f}"
-            )
+            # 检查是否触发止损 (多头: 价格跌破止损)
+            if low <= effective_stop:
+                reason = "追踪止损" if pos.trail_enabled else "止损"
+                return Signal(
+                    symbol=symbol,
+                    action="CLOSE",
+                    price=effective_stop,
+                    reason=f"多头{reason} @ {effective_stop:.2f}",
+                    side="SELL"  # 平多
+                )
 
-        return Signal(symbol=symbol, action="NONE", price=0, reason="持仓中")
+        else:  # SHORT
+            # ===== 空头管理 =====
+            # 更新最低价
+            if low < pos.lowest_price or pos.lowest_price == 0:
+                pos.lowest_price = low
+
+            # 计算当前盈亏R倍数 (空头: 入场价 - 当前价)
+            profit_R = (pos.entry_price - price) / pos.R_value
+
+            # 启用追踪止损
+            if not pos.trail_enabled and profit_R >= self.config.enable_trail_after_R:
+                pos.trail_enabled = True
+                pos.trail_stop = pos.lowest_price + self.config.trail_k_atr * atr
+
+            # 更新追踪止损 (空头: 追踪止损跟随最低价向下移动)
+            if pos.trail_enabled:
+                new_trail = pos.lowest_price + self.config.trail_k_atr * atr
+                if pos.trail_stop is None or new_trail < pos.trail_stop:
+                    pos.trail_stop = new_trail
+
+            # 确定有效止损价 (空头止损在上方)
+            effective_stop = pos.stop_price
+            if pos.trail_stop and pos.trail_stop < effective_stop:
+                effective_stop = pos.trail_stop
+
+            # 检查是否触发止损 (空头: 价格涨破止损)
+            if high >= effective_stop:
+                reason = "追踪止损" if pos.trail_enabled else "止损"
+                return Signal(
+                    symbol=symbol,
+                    action="CLOSE",
+                    price=effective_stop,
+                    reason=f"空头{reason} @ {effective_stop:.2f}",
+                    side="BUY"  # 平空
+                )
+
+        return Signal(symbol=symbol, action="NONE", price=0,
+                      reason=f"{'多' if pos.side == 'LONG' else '空'}头持仓中")
 
     def _check_entry(self, symbol: str, price: float, high: float,
                      current_time: datetime, atr: float) -> Signal:
-        """检查是否满足开仓条件"""
+        """检查是否满足开仓条件 (支持做多和做空)"""
 
         # 风控检查
         if self.daily_pnl <= -self.config.daily_loss_limit:
@@ -277,26 +331,35 @@ class FOMOStrategy:
             if current_time < self.symbol_cooldowns[symbol]:
                 return Signal(symbol=symbol, action="NONE", price=0, reason="品种冷却期")
 
-        # 突破检查
+        # 数据检查
         lookback = self.config.breakout_lookback
         if len(self.highs) < lookback + 1:
             return Signal(symbol=symbol, action="NONE", price=0, reason="数据不足")
 
+        # 计算突破水平
         highest = max(self.highs[-lookback-1:-1])  # 不包含当前K线
-        breakout_level = highest + self.config.breakout_buffer_atr * atr
+        lowest = min(self.lows[-lookback-1:-1])  # 不包含当前K线
+        upper_breakout = highest + self.config.breakout_buffer_atr * atr
+        lower_breakout = lowest - self.config.breakout_buffer_atr * atr
 
-        if price <= breakout_level:
-            return Signal(symbol=symbol, action="NONE", price=0, reason="未突破")
-
-        # 成交量确认
+        # 成交量检查
         vol_ratio = self.ta.get_volume_ratio(
             self.volumes, len(self.volumes) - 1, self.config.vol_ma_period
         )
+
+        # 判断突破方向 (根据配置决定是否启用)
+        is_long_breakout = self.config.enable_long and price > upper_breakout
+        is_short_breakout = self.config.enable_short and price < lower_breakout
+
+        if not is_long_breakout and not is_short_breakout:
+            return Signal(symbol=symbol, action="NONE", price=0, reason="未突破")
+
+        # 成交量确认
         if vol_ratio < self.config.vol_ratio_entry:
             return Signal(symbol=symbol, action="NONE", price=0,
                          reason=f"成交量不足 ({vol_ratio:.1f}x < {self.config.vol_ratio_entry}x)")
 
-        # 计算止损
+        # 计算止损百分比
         stop_pct = self.config.k_stop_atr * atr / price
         stop_pct = max(self.config.stop_pct_min,
                        min(stop_pct, self.config.stop_pct_max))
@@ -304,26 +367,43 @@ class FOMOStrategy:
         if stop_pct >= self.config.stop_pct_max:
             return Signal(symbol=symbol, action="NONE", price=0, reason="波动率过高")
 
-        # 计算仓位
-        entry_price = price * (1 + self.config.slippage)
-        stop_price = entry_price * (1 - stop_pct)
-        notional = self.config.risk_per_trade / stop_pct
-        quantity = notional / entry_price
-
         # 检查保证金
         leverage = self._calculate_leverage(stop_pct)
+        notional = self.config.risk_per_trade / stop_pct
         required_margin = notional / leverage
         if required_margin > self.capital * 0.5:
             return Signal(symbol=symbol, action="NONE", price=0, reason="资金不足")
 
-        return Signal(
-            symbol=symbol,
-            action="OPEN_LONG",
-            price=entry_price,
-            stop_price=stop_price,
-            quantity=quantity,
-            reason=f"突破入场 Vol:{vol_ratio:.1f}x Stop:{stop_pct*100:.1f}%"
-        )
+        if is_long_breakout:
+            # ===== 做多 =====
+            entry_price = price * (1 + self.config.slippage)
+            stop_price = entry_price * (1 - stop_pct)
+            quantity = notional / entry_price
+
+            return Signal(
+                symbol=symbol,
+                action="OPEN_LONG",
+                price=entry_price,
+                stop_price=stop_price,
+                quantity=quantity,
+                reason=f"向上突破 Vol:{vol_ratio:.1f}x Stop:{stop_pct*100:.1f}%",
+                side="BUY"
+            )
+        else:
+            # ===== 做空 =====
+            entry_price = price * (1 - self.config.slippage)  # 空头滑点向下
+            stop_price = entry_price * (1 + stop_pct)  # 空头止损在上方
+            quantity = notional / entry_price
+
+            return Signal(
+                symbol=symbol,
+                action="OPEN_SHORT",
+                price=entry_price,
+                stop_price=stop_price,
+                quantity=quantity,
+                reason=f"向下突破 Vol:{vol_ratio:.1f}x Stop:{stop_pct*100:.1f}%",
+                side="SELL"
+            )
 
     def _calculate_leverage(self, stop_pct: float) -> int:
         """计算杠杆倍数"""
@@ -334,7 +414,7 @@ class FOMOStrategy:
 
     def on_trade_executed(self, symbol: str, action: str, price: float,
                           quantity: float, timestamp: datetime):
-        """交易执行后回调"""
+        """交易执行后回调 (支持多头和空头)"""
         if action == "OPEN_LONG":
             atr = self.ta.calculate_atr(
                 self.highs, self.lows, self.closes, self.config.atr_period
@@ -354,6 +434,35 @@ class FOMOStrategy:
                 stop_price=stop_price,
                 R_value=price - stop_price,
                 highest_price=price,
+                lowest_price=price,
+                entry_time=timestamp,
+                entry_atr=atr
+            )
+
+            # 扣除手续费
+            commission = price * quantity * self.config.commission_rate
+            self.capital -= commission
+
+        elif action == "OPEN_SHORT":
+            atr = self.ta.calculate_atr(
+                self.highs, self.lows, self.closes, self.config.atr_period
+            ) or 0
+
+            stop_pct = self.config.k_stop_atr * atr / price
+            stop_pct = max(self.config.stop_pct_min,
+                           min(stop_pct, self.config.stop_pct_max))
+            stop_price = price * (1 + stop_pct)  # 空头止损在上方
+
+            self.position = Position(
+                symbol=symbol,
+                side="SHORT",
+                entry_price=price,
+                avg_price=price,
+                quantity=quantity,
+                stop_price=stop_price,
+                R_value=stop_price - price,  # 空头的R值
+                highest_price=price,
+                lowest_price=price,
                 entry_time=timestamp,
                 entry_atr=atr
             )
@@ -363,8 +472,12 @@ class FOMOStrategy:
             self.capital -= commission
 
         elif action == "CLOSE" and self.position:
-            # 计算盈亏
-            pnl = (price - self.position.avg_price) * self.position.quantity
+            # 计算盈亏 (区分多空)
+            if self.position.side == "LONG":
+                pnl = (price - self.position.avg_price) * self.position.quantity
+            else:  # SHORT
+                pnl = (self.position.avg_price - price) * self.position.quantity
+
             commission = price * self.position.quantity * self.config.commission_rate
             pnl -= commission
 
