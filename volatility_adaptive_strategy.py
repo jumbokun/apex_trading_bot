@@ -1,0 +1,643 @@
+"""
+波动率自适应Delta中性策略 - Volatility Adaptive Neutral Strategy
+================================================================
+
+核心逻辑：
+1. 根据市场波动率自动调整目标仓位大小
+   - 高波动率 -> 降低仓位（风险控制）
+   - 低波动率 -> 增加仓位（捕捉更多收益）
+
+2. 动态分配空头仓位
+   - ETH和SOL按各自波动率反比分配
+   - 高波动的币种占比更少
+
+3. 保持Delta中性
+   - 多头总价值 ≈ 空头总价值
+   - 自动调仓维持平衡
+
+波动率计算：
+- 使用24小时价格波动幅度 (High-Low)/Close
+- 或使用ATR (Average True Range)
+
+仓位公式：
+- target_notional = max_notional - (volatility - vol_low) / (vol_high - vol_low) * (max_notional - min_notional)
+- 当 volatility <= vol_low 时，target = max_notional
+- 当 volatility >= vol_high 时，target = min_notional
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+from enum import Enum
+import time
+import math
+import json
+import ssl
+import urllib.request
+from datetime import datetime, timedelta
+
+
+class PositionSide(Enum):
+    LONG = "LONG"
+    SHORT = "SHORT"
+
+
+@dataclass
+class VolatilityConfig:
+    """波动率配置"""
+    # 波动率阈值 (4小时波动幅度百分比)
+    # 4h波动率通常在1%~5%之间，需要更敏感的阈值
+    vol_low: float = 0.01    # 1% - 低波动阈值 (满仓)
+    vol_high: float = 0.04   # 4% - 高波动阈值 (最低仓)
+
+    # ATR周期
+    atr_period: int = 14
+
+    # 波动率平滑周期 (避免频繁调整)
+    smoothing_period: int = 6  # 6小时移动平均
+
+
+@dataclass
+class AdaptiveHedgingConfig:
+    """波动率自适应对冲配置"""
+
+    # 仓位上下限 (单边)
+    min_notional: float = 25000.0   # 最小单边仓位 25,000U
+    max_notional: float = 75000.0   # 最大单边仓位 75,000U
+
+    # 币种配置
+    long_symbol: str = "BTC-USDT"   # 多头币种
+    short_symbols: List[str] = field(default_factory=lambda: ["ETH-USDT", "SOL-USDT"])
+
+    # 波动率配置
+    volatility: VolatilityConfig = field(default_factory=VolatilityConfig)
+
+    # 杠杆
+    leverage: int = 3
+
+    # 调仓参数
+    rebalance_interval_seconds: int = 300   # 5分钟检查
+    min_rebalance_interval_seconds: int = 300
+    scale_amount: float = 2000.0           # 每次调仓金额
+    min_trade_notional: float = 100.0
+
+    # Delta中性阈值
+    delta_threshold_pct: float = 0.03      # 3%偏差触发
+    emergency_delta_pct: float = 0.10      # 10%紧急调仓
+
+    # 波动率检查间隔
+    volatility_check_interval: int = 300   # 5分钟检查一次波动率
+
+
+@dataclass
+class Position:
+    """持仓信息"""
+    symbol: str
+    side: PositionSide
+    quantity: float = 0.0
+    avg_price: float = 0.0
+    target_notional: float = 0.0
+    current_volatility: float = 0.0  # 当前波动率
+
+    def get_notional(self, price: float) -> float:
+        return self.quantity * price
+
+    def get_delta(self, price: float) -> float:
+        notional = self.get_notional(price)
+        return notional if self.side == PositionSide.LONG else -notional
+
+
+@dataclass
+class RebalanceAction:
+    """调仓操作"""
+    symbol: str
+    side: str  # "BUY" or "SELL"
+    quantity: float
+    notional: float
+    reason: str
+
+    def __repr__(self):
+        return f"{self.symbol} {self.side} {self.quantity:.6f} (${self.notional:.0f}) - {self.reason}"
+
+
+class VolatilityCalculator:
+    """波动率计算器"""
+
+    def __init__(self):
+        self.price_history: Dict[str, List[dict]] = {}  # symbol -> [{time, open, high, low, close}]
+        self.volatility_cache: Dict[str, Tuple[float, float]] = {}  # symbol -> (volatility, timestamp)
+        self.cache_ttl = 60  # 缓存60秒
+
+    def fetch_klines(self, symbol: str, interval: str = "1h", limit: int = 24) -> List[dict]:
+        """从Binance获取K线数据"""
+        binance_symbol = symbol.replace("-", "")
+        url = f"https://api.binance.com/api/v3/klines?symbol={binance_symbol}&interval={interval}&limit={limit}"
+
+        try:
+            ssl_ctx = ssl.create_default_context()
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                klines = []
+                for k in data:
+                    klines.append({
+                        'time': k[0],
+                        'open': float(k[1]),
+                        'high': float(k[2]),
+                        'low': float(k[3]),
+                        'close': float(k[4]),
+                        'volume': float(k[5])
+                    })
+                return klines
+        except Exception as e:
+            print(f"获取K线失败 {symbol}: {e}")
+            return []
+
+    def calculate_4h_volatility(self, symbol: str) -> float:
+        """计算最近4小时价格波动率
+
+        计算方法: (4小时内最高价 - 4小时内最低价) / 当前价格
+        这更能反映当前市场的实际波动情况
+        """
+        # 检查缓存
+        now = time.time()
+        if symbol in self.volatility_cache:
+            vol, ts = self.volatility_cache[symbol]
+            if now - ts < self.cache_ttl:
+                return vol
+
+        # 获取最近4小时的15分钟K线 (16根)
+        klines = self.fetch_klines(symbol, "15m", 16)
+        if not klines:
+            return 0.05  # 默认5%
+
+        # 计算4小时内的最高价和最低价
+        high_4h = max(k['high'] for k in klines)
+        low_4h = min(k['low'] for k in klines)
+        current_close = klines[-1]['close']  # 最新收盘价
+
+        if current_close <= 0:
+            return 0.05
+
+        # 4小时波动率
+        vol_4h = (high_4h - low_4h) / current_close
+
+        # 缓存结果
+        self.volatility_cache[symbol] = (vol_4h, now)
+
+        return vol_4h
+
+    def calculate_24h_volatility(self, symbol: str) -> float:
+        """计算24小时波动率 (向后兼容)"""
+        return self.calculate_4h_volatility(symbol)
+
+    def calculate_atr(self, symbol: str, period: int = 14) -> float:
+        """计算ATR (Average True Range)"""
+        klines = self.fetch_klines(symbol, "1h", period + 1)
+        if len(klines) < period + 1:
+            return 0.0
+
+        true_ranges = []
+        for i in range(1, len(klines)):
+            high = klines[i]['high']
+            low = klines[i]['low']
+            prev_close = klines[i-1]['close']
+
+            tr = max(
+                high - low,
+                abs(high - prev_close),
+                abs(low - prev_close)
+            )
+            true_ranges.append(tr)
+
+        return sum(true_ranges[-period:]) / period
+
+    def get_volatility_score(self, symbol: str, config: VolatilityConfig) -> float:
+        """获取波动率评分 (0-1)
+
+        0 = 最低波动 (vol <= vol_low)
+        1 = 最高波动 (vol >= vol_high)
+        """
+        vol = self.calculate_24h_volatility(symbol)
+
+        if vol <= config.vol_low:
+            return 0.0
+        elif vol >= config.vol_high:
+            return 1.0
+        else:
+            return (vol - config.vol_low) / (config.vol_high - config.vol_low)
+
+
+class VolatilityAdaptiveStrategy:
+    """波动率自适应Delta中性策略"""
+
+    def __init__(self, config: AdaptiveHedgingConfig = None):
+        self.config = config or AdaptiveHedgingConfig()
+        self.vol_calc = VolatilityCalculator()
+
+        self.positions: Dict[str, Position] = {}
+        self.prices: Dict[str, float] = {}
+        self.volatilities: Dict[str, float] = {}
+
+        self.last_volatility_check = 0
+        self.last_rebalance_time = 0
+        self.rebalance_count = 0
+        self.total_volume = 0.0
+
+        # 初始化持仓
+        self._init_positions()
+
+    def _init_positions(self):
+        """初始化持仓结构"""
+        # 多头
+        self.positions[self.config.long_symbol] = Position(
+            symbol=self.config.long_symbol,
+            side=PositionSide.LONG,
+            target_notional=self.config.max_notional
+        )
+
+        # 空头
+        for symbol in self.config.short_symbols:
+            self.positions[symbol] = Position(
+                symbol=symbol,
+                side=PositionSide.SHORT,
+                target_notional=self.config.max_notional / len(self.config.short_symbols)
+            )
+
+    def update_price(self, symbol: str, price: float):
+        """更新价格"""
+        self.prices[symbol] = price
+
+    def update_position(self, symbol: str, quantity: float, avg_price: float):
+        """更新持仓"""
+        if symbol in self.positions:
+            self.positions[symbol].quantity = quantity
+            self.positions[symbol].avg_price = avg_price
+
+    def update_volatility(self, force: bool = False) -> Dict[str, float]:
+        """更新波动率数据
+
+        Returns:
+            {symbol: volatility} 字典
+        """
+        now = time.time()
+
+        # 检查是否需要更新
+        if not force and now - self.last_volatility_check < self.config.volatility_check_interval:
+            return self.volatilities
+
+        self.last_volatility_check = now
+
+        # 计算所有币种波动率
+        all_symbols = [self.config.long_symbol] + self.config.short_symbols
+        for symbol in all_symbols:
+            vol = self.vol_calc.calculate_24h_volatility(symbol)
+            self.volatilities[symbol] = vol
+            if symbol in self.positions:
+                self.positions[symbol].current_volatility = vol
+
+        return self.volatilities
+
+    def calculate_target_notional(self) -> Tuple[float, Dict[str, float]]:
+        """根据波动率计算目标仓位
+
+        Returns:
+            (总目标仓位, {symbol: 目标仓位})
+        """
+        # 更新波动率
+        self.update_volatility()
+
+        # 计算整体市场波动率 (取BTC波动率作为基准)
+        btc_vol = self.volatilities.get(self.config.long_symbol, 0.05)
+        vol_score = self.vol_calc.get_volatility_score(
+            self.config.long_symbol,
+            self.config.volatility
+        )
+
+        # 根据波动率计算目标仓位
+        # 高波动 (score=1) -> min_notional
+        # 低波动 (score=0) -> max_notional
+        target_per_side = self.config.max_notional - vol_score * (
+            self.config.max_notional - self.config.min_notional
+        )
+
+        targets = {}
+
+        # 多头目标
+        targets[self.config.long_symbol] = target_per_side
+
+        # 空头目标 - 按波动率反比分配
+        short_vols = {}
+        for symbol in self.config.short_symbols:
+            short_vols[symbol] = self.volatilities.get(symbol, 0.05)
+
+        # 计算反比权重
+        # 波动率越高，权重越低
+        total_inverse_vol = sum(1/v for v in short_vols.values() if v > 0)
+
+        for symbol in self.config.short_symbols:
+            vol = short_vols.get(symbol, 0.05)
+            if vol > 0 and total_inverse_vol > 0:
+                # 反比权重
+                weight = (1/vol) / total_inverse_vol
+            else:
+                # 平均分配
+                weight = 1.0 / len(self.config.short_symbols)
+
+            targets[symbol] = target_per_side * weight
+
+        return target_per_side * 2, targets  # 总仓位 = 多头 + 空头
+
+    def get_portfolio_delta(self) -> Tuple[float, float, float]:
+        """计算组合Delta
+
+        Returns: (总多头, 总空头, 净Delta)
+        """
+        total_long = 0.0
+        total_short = 0.0
+
+        for symbol, pos in self.positions.items():
+            price = self.prices.get(symbol, 0)
+            if price == 0:
+                continue
+
+            notional = pos.get_notional(price)
+            if pos.side == PositionSide.LONG:
+                total_long += notional
+            else:
+                total_short += notional
+
+        return total_long, total_short, total_long - total_short
+
+    def should_rebalance(self) -> Tuple[bool, str]:
+        """判断是否需要调仓"""
+        now = time.time()
+
+        # 检查时间间隔
+        if now - self.last_rebalance_time < self.config.min_rebalance_interval_seconds:
+            remaining = self.config.min_rebalance_interval_seconds - (now - self.last_rebalance_time)
+            return False, f"冷却中 (还需{remaining:.0f}秒)"
+
+        # 计算目标仓位
+        total_target, targets = self.calculate_target_notional()
+
+        # 检查是否有仓位需要调整
+        for symbol, pos in self.positions.items():
+            price = self.prices.get(symbol, 0)
+            if price <= 0:
+                continue
+
+            current = pos.get_notional(price)
+            target = targets.get(symbol, 0)
+            gap = abs(target - current)
+
+            # 需要加仓或减仓
+            if gap >= self.config.min_trade_notional:
+                direction = "加仓" if target > current else "减仓"
+                return True, f"{symbol} 需要{direction} (当前${current:.0f} -> 目标${target:.0f})"
+
+        # 检查Delta偏差
+        total_long, total_short, net_delta = self.get_portfolio_delta()
+        total_exposure = total_long + total_short
+
+        if total_exposure > 0:
+            imbalance = abs(net_delta) / total_exposure
+            if imbalance >= self.config.emergency_delta_pct:
+                return True, f"紧急: Delta偏差 {imbalance:.1%}"
+            if imbalance >= self.config.delta_threshold_pct:
+                return True, f"Delta偏差 {imbalance:.1%}"
+
+        return False, "无需调仓"
+
+    def calculate_rebalance_actions(self) -> List[RebalanceAction]:
+        """计算调仓操作"""
+        actions = []
+
+        # 获取目标仓位
+        total_target, targets = self.calculate_target_notional()
+
+        # 计算每个币种需要的调整
+        adjustments = []  # [(symbol, current, target, gap, price)]
+
+        for symbol, pos in self.positions.items():
+            price = self.prices.get(symbol, 0)
+            if price <= 0:
+                continue
+
+            current = pos.get_notional(price)
+            target = targets.get(symbol, 0)
+            gap = target - current  # 正数=需要加仓, 负数=需要减仓
+
+            if abs(gap) >= self.config.min_trade_notional:
+                adjustments.append((symbol, pos, current, target, gap, price))
+
+        if not adjustments:
+            return actions
+
+        # 按gap大小排序（优先处理偏差大的）
+        adjustments.sort(key=lambda x: abs(x[4]), reverse=True)
+
+        # 分离加仓和减仓
+        scale_up = [(s, p, c, t, g, pr) for s, p, c, t, g, pr in adjustments if g > 0]
+        scale_down = [(s, p, c, t, g, pr) for s, p, c, t, g, pr in adjustments if g < 0]
+
+        # 限制每次调仓金额
+        max_adjust = self.config.scale_amount
+
+        # 处理需要加仓的
+        long_scale_up = [x for x in scale_up if x[1].side == PositionSide.LONG]
+        short_scale_up = [x for x in scale_up if x[1].side == PositionSide.SHORT]
+
+        # 处理需要减仓的
+        long_scale_down = [x for x in scale_down if x[1].side == PositionSide.LONG]
+        short_scale_down = [x for x in scale_down if x[1].side == PositionSide.SHORT]
+
+        # Delta中性：多空同时加仓或同时减仓
+        if long_scale_up and short_scale_up:
+            # 同时加多头和空头
+            long_item = long_scale_up[0]
+
+            # 多头加仓金额
+            long_add = min(max_adjust / 2, long_item[4])
+            if long_add >= self.config.min_trade_notional:
+                qty = long_add / long_item[5]
+                actions.append(RebalanceAction(
+                    symbol=long_item[0],
+                    side="BUY",
+                    quantity=qty,
+                    notional=long_add,
+                    reason=f"加仓 LONG (波动率调整)"
+                ))
+
+            # 空头加仓 - 按比例分配给多个空头
+            short_add_total = long_add
+            for short_item in short_scale_up:
+                # 按gap比例分配
+                total_short_gap = sum(x[4] for x in short_scale_up)
+                if total_short_gap > 0:
+                    ratio = short_item[4] / total_short_gap
+                else:
+                    ratio = 1.0 / len(short_scale_up)
+
+                short_add = short_add_total * ratio
+                if short_add >= self.config.min_trade_notional / 2:
+                    qty = short_add / short_item[5]
+                    actions.append(RebalanceAction(
+                        symbol=short_item[0],
+                        side="SELL",
+                        quantity=qty,
+                        notional=short_add,
+                        reason=f"加仓 SHORT (波动率调整)"
+                    ))
+
+        elif long_scale_down and short_scale_down:
+            # 同时减多头和空头
+            long_item = long_scale_down[0]
+
+            # 多头减仓金额
+            long_reduce = min(max_adjust / 2, abs(long_item[4]))
+            if long_reduce >= self.config.min_trade_notional:
+                qty = long_reduce / long_item[5]
+                actions.append(RebalanceAction(
+                    symbol=long_item[0],
+                    side="SELL",
+                    quantity=qty,
+                    notional=long_reduce,
+                    reason=f"减仓 LONG (波动率调整)"
+                ))
+
+            # 空头减仓
+            short_reduce_total = long_reduce
+            for short_item in short_scale_down:
+                total_short_gap = sum(abs(x[4]) for x in short_scale_down)
+                if total_short_gap > 0:
+                    ratio = abs(short_item[4]) / total_short_gap
+                else:
+                    ratio = 1.0 / len(short_scale_down)
+
+                short_reduce = short_reduce_total * ratio
+                if short_reduce >= self.config.min_trade_notional / 2:
+                    qty = short_reduce / short_item[5]
+                    actions.append(RebalanceAction(
+                        symbol=short_item[0],
+                        side="BUY",
+                        quantity=qty,
+                        notional=short_reduce,
+                        reason=f"减仓 SHORT (波动率调整)"
+                    ))
+
+        # 处理Delta不平衡 (只需要单边调整)
+        elif long_scale_up and not short_scale_up:
+            # 只有多头需要加，检查是否偏空
+            total_long, total_short, net_delta = self.get_portfolio_delta()
+            if net_delta < 0:  # 偏空，可以加多头
+                long_item = long_scale_up[0]
+                add = min(max_adjust / 2, abs(net_delta), long_item[4])
+                if add >= self.config.min_trade_notional:
+                    qty = add / long_item[5]
+                    actions.append(RebalanceAction(
+                        symbol=long_item[0],
+                        side="BUY",
+                        quantity=qty,
+                        notional=add,
+                        reason=f"Delta修正 (偏空)"
+                    ))
+
+        elif short_scale_up and not long_scale_up:
+            # 只有空头需要加，检查是否偏多
+            total_long, total_short, net_delta = self.get_portfolio_delta()
+            if net_delta > 0:  # 偏多，可以加空头
+                for short_item in short_scale_up:
+                    add = min(max_adjust / 4, net_delta / len(short_scale_up), short_item[4])
+                    if add >= self.config.min_trade_notional / 2:
+                        qty = add / short_item[5]
+                        actions.append(RebalanceAction(
+                            symbol=short_item[0],
+                            side="SELL",
+                            quantity=qty,
+                            notional=add,
+                            reason=f"Delta修正 (偏多)"
+                        ))
+
+        return actions
+
+    def record_rebalance(self, actions: List[RebalanceAction]):
+        """记录调仓"""
+        self.last_rebalance_time = time.time()
+        self.rebalance_count += 1
+        for action in actions:
+            self.total_volume += action.notional
+
+    def get_status(self) -> dict:
+        """获取策略状态"""
+        total_long, total_short, net_delta = self.get_portfolio_delta()
+        total_exposure = total_long + total_short
+        total_target, targets = self.calculate_target_notional()
+
+        positions_detail = []
+        for symbol, pos in self.positions.items():
+            price = self.prices.get(symbol, 0)
+            target = targets.get(symbol, 0)
+            positions_detail.append({
+                "symbol": symbol,
+                "side": pos.side.value,
+                "quantity": pos.quantity,
+                "price": price,
+                "current_notional": pos.get_notional(price),
+                "target_notional": target,
+                "volatility": self.volatilities.get(symbol, 0),
+                "fill_pct": pos.get_notional(price) / target * 100 if target > 0 else 0
+            })
+
+        return {
+            "total_long": total_long,
+            "total_short": total_short,
+            "net_delta": net_delta,
+            "total_exposure": total_exposure,
+            "target_exposure": total_target,
+            "imbalance_pct": abs(net_delta) / total_exposure if total_exposure > 0 else 0,
+            "rebalance_count": self.rebalance_count,
+            "total_volume": self.total_volume,
+            "positions": positions_detail,
+            "volatilities": self.volatilities
+        }
+
+
+# 测试
+if __name__ == "__main__":
+    config = AdaptiveHedgingConfig(
+        min_notional=25000.0,
+        max_notional=75000.0,
+        long_symbol="BTC-USDT",
+        short_symbols=["ETH-USDT", "SOL-USDT"]
+    )
+
+    strategy = VolatilityAdaptiveStrategy(config)
+
+    # 模拟价格
+    strategy.update_price("BTC-USDT", 95000.0)
+    strategy.update_price("ETH-USDT", 3300.0)
+    strategy.update_price("SOL-USDT", 180.0)
+
+    # 更新波动率
+    print("正在获取波动率数据...")
+    vols = strategy.update_volatility(force=True)
+    print(f"\n波动率:")
+    for symbol, vol in vols.items():
+        print(f"  {symbol}: {vol*100:.2f}%")
+
+    # 计算目标仓位
+    total, targets = strategy.calculate_target_notional()
+    print(f"\n目标仓位 (总计 ${total:,.0f}):")
+    for symbol, target in targets.items():
+        pos = strategy.positions[symbol]
+        print(f"  {symbol}: {pos.side.value} ${target:,.0f}")
+
+    # 检查是否需要调仓
+    should, reason = strategy.should_rebalance()
+    print(f"\n需要调仓: {should} - {reason}")
+
+    if should:
+        actions = strategy.calculate_rebalance_actions()
+        print(f"\n调仓操作:")
+        for action in actions:
+            print(f"  {action}")
