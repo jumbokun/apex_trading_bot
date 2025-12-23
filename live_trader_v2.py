@@ -436,19 +436,116 @@ class LiveTraderV2:
         logger.info(f"账户状态:")
         logger.info(f"  账户ID: {data.get('id', 'N/A')}")
 
-        # 检查现有持仓
+        # 检查现有持仓并同步到策略
         positions = self.trader.get_positions()
         if positions:
             logger.info(f"  当前持仓: {len(positions)}")
             for p in positions:
-                logger.info(f"    {p.get('symbol')}: {p.get('size')} @ {p.get('entryPrice')}")
+                symbol = p.get('symbol')
+                size = float(p.get('size', 0))
+                entry_price = float(p.get('entryPrice', 0))
+                logger.info(f"    {symbol}: {size} @ {entry_price}")
+
+                # 同步持仓到策略
+                if symbol in self.strategies and size != 0:
+                    self._sync_position_to_strategy(symbol, p)
 
         return True
 
+    def _sync_position_to_strategy(self, symbol: str, exchange_pos: dict):
+        """
+        将交易所持仓同步到策略内部状态
+        用于启动时恢复现有持仓的管理
+        """
+        from fomo_strategy import Position
+
+        strategy = self.strategies[symbol]
+
+        # 解析交易所持仓
+        size = float(exchange_pos.get('size', 0))
+        entry_price = float(exchange_pos.get('entryPrice', 0))
+
+        if size == 0 or entry_price == 0:
+            return
+
+        # 判断多空方向
+        side = "LONG" if size > 0 else "SHORT"
+        quantity = abs(size)
+
+        # 计算止损 (使用默认ATR止损)
+        # 先获取15分钟K线数据计算ATR
+        klines = fetch_binance_klines(symbol, "15m", 100)
+        if klines:
+            for k in klines:
+                ts = k.get("t", 0)
+                if isinstance(ts, str):
+                    ts = int(ts)
+                dt = datetime.fromtimestamp(ts / 1000)
+                strategy.update(
+                    timestamp=dt,
+                    open_=float(k.get("o", 0)),
+                    high=float(k.get("h", 0)),
+                    low=float(k.get("l", 0)),
+                    close=float(k.get("c", 0)),
+                    volume=float(k.get("v", 0))
+                )
+
+        # 计算ATR
+        from fomo_strategy import TechnicalAnalysis
+        ta = TechnicalAnalysis()
+        atr = ta.calculate_atr(
+            strategy.highs, strategy.lows, strategy.closes,
+            strategy.config.atr_period
+        )
+        if atr is None:
+            atr = entry_price * 0.02  # 默认2%
+
+        # 计算止损价 - 同步持仓时使用更宽松的止损（至少1%，最多6%）
+        stop_distance = atr * strategy.config.k_stop_atr
+        stop_pct = stop_distance / entry_price
+
+        # 确保止损在合理范围内
+        min_stop_pct = strategy.config.stop_pct_min  # 1%
+        max_stop_pct = strategy.config.stop_pct_max  # 6%
+
+        if stop_pct < min_stop_pct:
+            stop_distance = entry_price * min_stop_pct
+            logger.info(f"  [同步] {symbol} 止损调整: ATR止损{stop_pct*100:.2f}%太小，使用最小{min_stop_pct*100:.0f}%")
+        elif stop_pct > max_stop_pct:
+            stop_distance = entry_price * max_stop_pct
+            logger.info(f"  [同步] {symbol} 止损调整: ATR止损{stop_pct*100:.2f}%太大，使用最大{max_stop_pct*100:.0f}%")
+
+        if side == "LONG":
+            stop_price = entry_price - stop_distance
+        else:
+            stop_price = entry_price + stop_distance
+
+        R_value = abs(entry_price - stop_price)
+
+        # 创建Position对象
+        position = Position(
+            symbol=symbol,
+            side=side,
+            entry_price=entry_price,
+            avg_price=entry_price,
+            quantity=quantity,
+            stop_price=stop_price,
+            R_value=R_value,
+            highest_price=entry_price,
+            lowest_price=entry_price,
+            trail_stop=None,
+            trail_enabled=False,
+            entry_time=datetime.now(),
+            entry_atr=atr
+        )
+
+        strategy.position = position
+        logger.info(f"  [同步] {symbol} {side} {quantity:.6f} @ {entry_price:.4f}, 止损: {stop_price:.4f}")
+
     def update_klines(self, symbol: str) -> bool:
-        """更新K线数据 - 使用Binance数据源"""
-        # 使用Binance获取K线 (成交量数据更活跃)
-        klines = fetch_binance_klines(symbol, "1m", 100)
+        """更新K线数据 - 使用Binance数据源 (15分钟线)"""
+        # 使用Binance获取15分钟K线 (减少噪音，信号更可靠)
+        klines = fetch_binance_klines(symbol, "15m", 100)
         if not klines:
             logger.warning(f"无法获取{symbol}的Binance K线数据")
             return False
@@ -489,6 +586,42 @@ class LiveTraderV2:
             if strategy.position is not None:
                 count += 1
         return count
+
+    def _log_signal_details(self, symbol: str, strategy, signal: Signal):
+        """打印详细的信号状态到日志"""
+        if len(strategy.closes) < strategy.config.breakout_lookback:
+            return
+
+        # 获取市场数据
+        current_price = strategy.closes[-1]
+        lookback = strategy.config.breakout_lookback
+
+        # 计算关键指标
+        recent_highs = strategy.highs[-lookback:]
+        recent_lows = strategy.lows[-lookback:]
+        breakout_high = max(recent_highs[:-1]) if len(recent_highs) > 1 else recent_highs[0]
+        breakout_low = min(recent_lows[:-1]) if len(recent_lows) > 1 else recent_lows[0]
+
+        # 成交量分析
+        vol_avg = sum(strategy.volumes[-strategy.config.vol_ma_period:]) / strategy.config.vol_ma_period
+        current_vol = strategy.volumes[-1]
+        vol_ratio = current_vol / vol_avg if vol_avg > 0 else 0
+
+        # 只在有信号或接近突破时打印
+        price_to_high_pct = (current_price - breakout_high) / breakout_high * 100
+        price_to_low_pct = (breakout_low - current_price) / current_price * 100
+
+        if signal.action != "NONE":
+            # 有信号时打印详细信息
+            logger.info(f"[{symbol}] === 信号详情 ===")
+            logger.info(f"  价格: {current_price:.4f} | 突破高点: {breakout_high:.4f} | 突破低点: {breakout_low:.4f}")
+            logger.info(f"  距高点: {price_to_high_pct:+.2f}% | 成交量: {vol_ratio:.1f}x (需要{strategy.config.vol_ratio_entry}x)")
+            if signal.action in ["OPEN_LONG", "OPEN_SHORT"]:
+                stop_pct = abs(signal.price - signal.stop_price) / signal.price * 100
+                logger.info(f"  止损价: {signal.stop_price:.4f} ({stop_pct:.2f}%) | 仓位: {signal.quantity:.6f}")
+        elif abs(price_to_high_pct) < 1.0 or abs(price_to_low_pct) < 1.0:
+            # 接近突破点时也打印
+            logger.debug(f"[{symbol}] 接近突破 | 价格:{current_price:.4f} 高点:{breakout_high:.4f} 距离:{price_to_high_pct:+.2f}% 量:{vol_ratio:.1f}x")
 
     def process_signal(self, symbol: str, signal: Signal):
         """处理交易信号 (支持多空双向)"""
@@ -578,9 +711,46 @@ class LiveTraderV2:
                     else:
                         logger.error(f"{side_text}失败: {result}")
 
+    def sync_positions_with_exchange(self):
+        """
+        同步持仓状态 - 检查策略内部持仓与交易所实际持仓是否一致
+        如果交易所已经没有某个币的持仓，但策略还记录着，则清理策略状态
+        """
+        # 获取交易所实际持仓
+        exchange_positions = self.trader.get_positions()
+        exchange_symbols = set()
+
+        for pos in exchange_positions:
+            symbol = pos.get("symbol", "")
+            size = float(pos.get("size", 0))
+            if size != 0:
+                exchange_symbols.add(symbol)
+
+        # 检查每个策略的持仓状态
+        for symbol in self.symbols:
+            strategy = self.strategies[symbol]
+            if strategy.position is not None:
+                # 策略认为有持仓，检查交易所是否也有
+                if symbol not in exchange_symbols:
+                    # 交易所没有这个持仓了，说明被手动平掉了
+                    logger.warning(f"[{symbol}] 检测到手动平仓，清理策略持仓状态")
+                    # 记录这笔交易（假设以当前价格平仓）
+                    current_price = strategy.closes[-1] if strategy.closes else strategy.position.entry_price
+                    strategy.on_trade_executed(
+                        symbol, "CLOSE", current_price,
+                        strategy.position.quantity, datetime.now()
+                    )
+
     def run_once(self):
         """运行一次检查"""
         logger.debug(f"--- 开始检查 ({datetime.now().strftime('%H:%M:%S')}) ---")
+
+        # 同步持仓状态（检测手动平仓）
+        try:
+            self.sync_positions_with_exchange()
+        except Exception as e:
+            logger.error(f"同步持仓状态失败: {e}")
+
         for symbol in self.symbols:
             try:
                 # 更新数据
@@ -588,13 +758,17 @@ class LiveTraderV2:
                     continue
 
                 # 生成信号
-                signal = self.strategies[symbol].generate_signal(symbol)
+                strategy = self.strategies[symbol]
+                signal = strategy.generate_signal(symbol)
+
+                # 打印详细信号状态
+                self._log_signal_details(symbol, strategy, signal)
 
                 # 处理信号
                 self.process_signal(symbol, signal)
 
                 # 只输出持仓状态（重要信息）
-                status = self.strategies[symbol].get_status()
+                status = strategy.get_status()
                 if status["has_position"]:
                     pos = status["position"]
                     logger.info(f"[{symbol}] 持仓中: {pos['quantity']:.6f} @ {pos['entry_price']:.2f}, "
@@ -687,15 +861,17 @@ def main():
         "DOGE-USDT", "XRP-USDT", "ADA-USDT", "AVAX-USDT", "DOT-USDT",
     ]
     TESTNET = os.getenv("APEX_TESTNET", "true").lower() == "true"
-    DRY_RUN = False  # 实盘交易
+    DRY_RUN = True  # 模拟交易 - 只打印信号不实际下单
 
     print("=" * 50)
     print("FOMO策略实盘交易器 V2")
     print("=" * 50)
     print(f"网络: {'测试网' if TESTNET else '主网'}")
     print(f"模式: {'模拟运行' if DRY_RUN else '实盘交易'}")
-    print(f"交易对: {SYMBOLS}")
-    print(f"K线数据: Binance (成交量更活跃)")
+    print(f"交易对: {len(SYMBOLS)}个")
+    print(f"K线周期: 15分钟 (Binance数据)")
+    print(f"突破回看: 20根K线 (5小时)")
+    print(f"止损范围: 2%-8%")
     print(f"交易执行: Apex Exchange")
     print("=" * 50)
 

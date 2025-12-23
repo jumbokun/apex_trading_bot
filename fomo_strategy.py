@@ -32,17 +32,17 @@ class FOMOStrategyConfig:
     enable_long: bool = True  # 是否允许做多
     enable_short: bool = False  # 是否允许做空 (默认关闭，回测显示空头表现差)
 
-    # 入场条件
-    breakout_lookback: int = 60  # 突破回看周期
+    # 入场条件 - 使用15分钟K线
+    breakout_lookback: int = 20  # 突破回看周期 (15min线20根=5小时)
     breakout_buffer_atr: float = 0.4  # 突破缓冲(ATR倍数)
     vol_ratio_entry: float = 2.0  # 入场成交量要求(均值倍数)
-    vol_ma_period: int = 60  # 成交量均线周期
+    vol_ma_period: int = 20  # 成交量均线周期
 
-    # 止损
+    # 止损 - 放宽止损距离
     atr_period: int = 14  # ATR周期
-    k_stop_atr: float = 1.5  # 止损距离(ATR倍数)
-    stop_pct_min: float = 0.01  # 最小止损百分比
-    stop_pct_max: float = 0.06  # 最大止损百分比
+    k_stop_atr: float = 2.0  # 止损距离(ATR倍数) - 从1.5提高到2.0
+    stop_pct_min: float = 0.02  # 最小止损百分比 - 从1%提高到2%
+    stop_pct_max: float = 0.08  # 最大止损百分比 - 从6%提高到8%
 
     # 追踪止损 - 优化后参数
     trail_k_atr: float = 7.0  # 追踪止损距离(ATR倍数) - 从5.0优化到7.0
@@ -59,10 +59,10 @@ class FOMOStrategyConfig:
     symbol_cooldown_minutes: int = 60  # 同品种冷却时间
     max_positions: int =  10  # 最大同时持仓数
 
-    # 波动率调整仓位
+    # 波动率调整仓位 - 降低仓位大小
     # 低波动率(止损<2%) -> 较大仓位, 高波动率(止损>4%) -> 较小仓位
-    notional_min: float = 500.0  # 最小名义价值
-    notional_max: float = 2500.0  # 最大名义价值 (降低风险)
+    notional_min: float = 100.0  # 最小名义价值 (从500降到100)
+    notional_max: float = 500.0  # 最大名义价值 (从2500降到500)
 
     # 执行
     commission_rate: float = 0.0006  # 手续费率
