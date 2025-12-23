@@ -1094,25 +1094,27 @@ def main():
     PRE_SETTLEMENT_MINUTES = args.pre_settlement
 
     # 策略配置
-    # 加仓测试: BTC多$400 + ETH空$200 + SOL空$200 = 总$800 Delta中性
-    # 如果启用动态费率，会根据实时费率自动调整
+    # 目标: 100,000U 总仓位 (多头50,000U + 空头50,000U) = Delta中性
+    # BTC多$50000 vs ETH空$25000 + SOL空$25000
+    # 每次加仓2000U（多头1000U + 空头各500U），1分钟一次
     config = HedgingConfig(
         assets=[
-            AssetConfig("BTC-USDT", PositionSide.LONG, 400.0),
-            AssetConfig("ETH-USDT", PositionSide.SHORT, 200.0),
-            AssetConfig("SOL-USDT", PositionSide.SHORT, 200.0),
+            AssetConfig("BTC-USDT", PositionSide.LONG, 50000.0),
+            AssetConfig("ETH-USDT", PositionSide.SHORT, 25000.0),
+            AssetConfig("SOL-USDT", PositionSide.SHORT, 25000.0),
         ],
         leverage=3,
-        rebalance_interval_seconds=900,  # 15分钟
-        delta_threshold_pct=0.05,  # 5%偏差触发
-        min_rebalance_interval_seconds=300,  # 最小5分钟间隔
-        max_rebalances_per_hour=12,
-        rebalance_step_pct=0.10,  # 每次调整10%
-        min_trade_notional=10.0,  # 降低最小交易额
+        rebalance_interval_seconds=60,  # 1分钟检查一次
+        delta_threshold_pct=0.03,  # 3%偏差触发调仓
+        min_rebalance_interval_seconds=60,  # 最小1分钟间隔
+        max_rebalances_per_hour=60,  # 每小时最多60次
+        scale_up_amount=2000.0,  # 每次加仓2000U（多空各1000U）
+        rebalance_step_pct=0.05,  # 每次调整5%
+        min_trade_notional=100.0,  # 最小交易额
     )
 
     print("="*60)
-    print("中性对冲策略交易器")
+    print("Delta中性对冲策略 - 缓慢加仓模式")
     print("="*60)
     print(f"网络: {'测试网' if TESTNET else '主网'}")
     print(f"模式: {'模拟运行' if DRY_RUN else '实盘交易'}")
@@ -1123,12 +1125,21 @@ def main():
     if DYNAMIC_FUNDING:
         print(f"费率检查间隔: {args.funding_interval}分钟")
         print(f"结算前检查: 提前{PRE_SETTLEMENT_MINUTES}分钟")
-    print(f"初始配置:")
+    print(f"\n目标配置 (总仓位: $100,000):")
+    total_long = sum(a.target_notional for a in config.assets if a.side == PositionSide.LONG)
+    total_short = sum(a.target_notional for a in config.assets if a.side == PositionSide.SHORT)
     for asset in config.assets:
-        print(f"  {asset.symbol}: {asset.side.value} ${asset.target_notional:.0f}")
-    print(f"目标: 净Delta = $0 (多空平衡)")
-    print(f"调仓间隔: {config.rebalance_interval_seconds/60:.0f}分钟")
-    print(f"偏差阈值: {config.delta_threshold_pct:.0%}")
+        print(f"  {asset.symbol}: {asset.side.value} ${asset.target_notional:,.0f}")
+    print(f"\n多头总计: ${total_long:,.0f}")
+    print(f"空头总计: ${total_short:,.0f}")
+    print(f"净Delta: ${total_long - total_short:,.0f} (目标: $0)")
+    print(f"\n加仓策略:")
+    print(f"  每次加仓: ${config.scale_up_amount:,.0f} (多头${config.scale_up_amount/2:,.0f} + 空头${config.scale_up_amount/2:,.0f})")
+    print(f"  加仓间隔: {config.rebalance_interval_seconds}秒 (1分钟)")
+    print(f"  预计达到目标: ~{int(100000 / config.scale_up_amount)}分钟 (~{int(100000 / config.scale_up_amount / 60)}小时)")
+    print(f"\n风控参数:")
+    print(f"  Delta偏差阈值: {config.delta_threshold_pct:.0%}")
+    print(f"  最小交易额: ${config.min_trade_notional:.0f}")
     print("="*60)
 
     if not TESTNET and not DRY_RUN:

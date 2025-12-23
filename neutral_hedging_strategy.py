@@ -54,30 +54,32 @@ class HedgingConfig:
     """中性对冲策略配置"""
 
     # 资产配置 - 默认: BTC多/ETH空/SOL空
-    # 选择依据: ETH和SOL费率较高，做空赚取资金费; BTC最稳定做多
+    # 目标总仓位: 100,000U (多头50,000U + 空头50,000U)
+    # BTC多头50,000U vs ETH空头25,000U + SOL空头25,000U
     assets: List[AssetConfig] = field(default_factory=lambda: [
-        AssetConfig("BTC-USDT", PositionSide.LONG, 4000.0, weight=1.0),
-        AssetConfig("ETH-USDT", PositionSide.SHORT, 2000.0, weight=1.0),
-        AssetConfig("SOL-USDT", PositionSide.SHORT, 2000.0, weight=1.0),
+        AssetConfig("BTC-USDT", PositionSide.LONG, 50000.0, weight=1.0),
+        AssetConfig("ETH-USDT", PositionSide.SHORT, 25000.0, weight=1.0),
+        AssetConfig("SOL-USDT", PositionSide.SHORT, 25000.0, weight=1.0),
     ])
 
     # 杠杆
     leverage: int = 3
 
-    # 调仓参数
-    rebalance_interval_seconds: int = 900  # 检查间隔（15分钟）
-    delta_threshold_pct: float = 0.05  # Delta偏差阈值（5%）
-    min_rebalance_interval_seconds: int = 300  # 最小调仓间隔（5分钟）
-    max_rebalances_per_hour: int = 12  # 每小时最大调仓次数
+    # 调仓参数 - 1分钟一次缓慢加仓
+    rebalance_interval_seconds: int = 60  # 检查间隔（1分钟）
+    delta_threshold_pct: float = 0.03  # Delta偏差阈值（3%）
+    min_rebalance_interval_seconds: int = 60  # 最小调仓间隔（1分钟）
+    max_rebalances_per_hour: int = 60  # 每小时最大调仓次数
 
-    # 单次调仓幅度
-    rebalance_step_pct: float = 0.10  # 每次调仓10%
-    min_trade_notional: float = 50.0  # 最小交易金额
+    # 单次调仓幅度 - 每次2000U
+    scale_up_amount: float = 2000.0  # 每次加仓金额（多空各1000U）
+    rebalance_step_pct: float = 0.05  # 每次调仓5%
+    min_trade_notional: float = 100.0  # 最小交易金额
 
     # 风险控制
-    max_single_position_notional: float = 10000.0  # 单仓位上限
-    max_total_exposure: float = 30000.0  # 总敞口上限
-    emergency_delta_pct: float = 0.20  # 紧急Delta阈值（20%触发强制调仓）
+    max_single_position_notional: float = 60000.0  # 单仓位上限
+    max_total_exposure: float = 120000.0  # 总敞口上限
+    emergency_delta_pct: float = 0.10  # 紧急Delta阈值（10%触发强制调仓）
 
     # 模式
     dry_run: bool = True  # 模拟模式
@@ -235,6 +237,18 @@ class NeutralHedgingStrategy:
         if imbalance_pct >= self.config.delta_threshold_pct:
             return True, f"Imbalance {imbalance_pct:.1%} >= {self.config.delta_threshold_pct:.1%}"
 
+        # 检查是否需要向目标仓位加仓（当前仓位远低于目标）
+        for symbol, pos in self.positions.items():
+            price = self.prices.get(symbol, 0)
+            if price > 0:
+                current_notional = pos.get_notional(price)
+                target_notional = pos.target_notional
+                if target_notional > 0:
+                    fill_ratio = current_notional / target_notional
+                    # 如果当前仓位不足目标的90%，需要加仓
+                    if fill_ratio < 0.90:
+                        return True, f"Scale up {symbol} ({fill_ratio:.0%} of target)"
+
         # 时间间隔调仓（维持交易量）
         if time_since_last >= self.config.rebalance_interval_seconds:
             return True, f"Time interval ({time_since_last/60:.1f}min)"
@@ -276,6 +290,12 @@ class NeutralHedgingStrategy:
             return actions
 
         imbalance_pct = abs(net_delta) / total_exposure
+
+        # 首先检查是否需要向目标仓位加仓（delta中性加仓）
+        # 找出所有低于目标的仓位，成对加仓（一个多头+一个空头）保持中性
+        scale_up_actions = self._calculate_scale_up_actions()
+        if scale_up_actions:
+            return scale_up_actions
 
         # 计算需要调整的金额
         # 目标：使 total_long ≈ total_short
@@ -376,6 +396,144 @@ class NeutralHedgingStrategy:
                             notional=reduce_qty * price,
                             reason=f"Reduce SHORT (delta {net_delta:.0f} -> {net_delta + reduce_qty*price:.0f})"
                         ))
+
+        return actions
+
+    def _calculate_scale_up_actions(self) -> List[RebalanceAction]:
+        """
+        计算向目标仓位加仓的操作（保持delta中性）
+
+        策略：
+        1. 找出所有低于目标的仓位
+        2. 成对加仓：多头和空头同时加相等金额，保持delta中性
+        3. 每次固定加2000U（多头1000U + 空头1000U），1分钟一次
+        """
+        actions = []
+
+        # 分离多头和空头仓位
+        long_needs_scale = []  # (symbol, pos, current_notional, gap_to_target, price)
+        short_needs_scale = []
+
+        for symbol, pos in self.positions.items():
+            price = self.prices.get(symbol, 0)
+            if price <= 0:
+                continue
+
+            current_notional = pos.get_notional(price)
+            target_notional = pos.target_notional
+
+            if target_notional <= 0:
+                continue
+
+            gap = target_notional - current_notional
+
+            # 只要还没达到目标就需要加仓
+            if gap >= self.config.min_trade_notional:
+                if pos.side == PositionSide.LONG:
+                    long_needs_scale.append((symbol, pos, current_notional, gap, price))
+                else:
+                    short_needs_scale.append((symbol, pos, current_notional, gap, price))
+
+        # 如果没有需要加仓的仓位，返回空
+        if not long_needs_scale and not short_needs_scale:
+            return actions
+
+        # 成对加仓：同时加多头和空头，保持中性
+        # 优先选择gap最大的仓位
+        long_needs_scale.sort(key=lambda x: x[3], reverse=True)
+        short_needs_scale.sort(key=lambda x: x[3], reverse=True)
+
+        # 固定每次加仓金额：2000U（多头1000U + 空头1000U）
+        # 从配置读取 scale_up_amount，默认2000U
+        total_scale_amount = getattr(self.config, 'scale_up_amount', 2000.0)
+        per_side_amount = total_scale_amount / 2  # 多空各一半 = 1000U
+
+        # 取加仓金额的较小值，保证两边加相等的量
+        if long_needs_scale and short_needs_scale:
+            # 两边都有需要加仓的，成对加
+            long_item = long_needs_scale[0]
+            short_item = short_needs_scale[0]
+
+            # 使用固定金额，但不能超过gap
+            long_add = min(per_side_amount, long_item[3])
+            short_add = min(per_side_amount, short_item[3])
+
+            # 取两者较小值，保证delta中性
+            add_amount = min(long_add, short_add)
+
+            # 确保加仓金额不会太小
+            add_amount = max(add_amount, self.config.min_trade_notional)
+
+            if add_amount >= self.config.min_trade_notional:
+                # 加多头
+                long_qty = add_amount / long_item[4]
+                actions.append(RebalanceAction(
+                    symbol=long_item[0],
+                    side="BUY",
+                    quantity=long_qty,
+                    notional=add_amount,
+                    reason=f"Scale up LONG +${add_amount:.0f}"
+                ))
+
+                # 加空头 - 如果有多个空头仓位，按比例分配
+                if len(short_needs_scale) >= 2:
+                    # 两个空头各加一半
+                    half_amount = add_amount / 2
+                    for short_item in short_needs_scale[:2]:
+                        actual_add = min(half_amount, short_item[3])
+                        if actual_add >= self.config.min_trade_notional / 2:
+                            short_qty = actual_add / short_item[4]
+                            actions.append(RebalanceAction(
+                                symbol=short_item[0],
+                                side="SELL",
+                                quantity=short_qty,
+                                notional=actual_add,
+                                reason=f"Scale up SHORT +${actual_add:.0f}"
+                            ))
+                else:
+                    # 只有一个空头
+                    short_qty = add_amount / short_item[4]
+                    actions.append(RebalanceAction(
+                        symbol=short_item[0],
+                        side="SELL",
+                        quantity=short_qty,
+                        notional=add_amount,
+                        reason=f"Scale up SHORT +${add_amount:.0f}"
+                    ))
+
+        elif long_needs_scale:
+            # 只有多头需要加仓（但这会破坏delta中性，需要谨慎）
+            # 只有在当前偏空时才加多头
+            total_long, total_short, net_delta = self.get_portfolio_delta()
+            if net_delta < 0:  # 偏空，可以加多头
+                long_item = long_needs_scale[0]
+                add_amount = min(per_side_amount, abs(net_delta), long_item[3])
+                if add_amount >= self.config.min_trade_notional:
+                    long_qty = add_amount / long_item[4]
+                    actions.append(RebalanceAction(
+                        symbol=long_item[0],
+                        side="BUY",
+                        quantity=long_qty,
+                        notional=add_amount,
+                        reason=f"Scale up LONG (delta correction) +${add_amount:.0f}"
+                    ))
+
+        elif short_needs_scale:
+            # 只有空头需要加仓
+            # 只有在当前偏多时才加空头
+            total_long, total_short, net_delta = self.get_portfolio_delta()
+            if net_delta > 0:  # 偏多，可以加空头
+                short_item = short_needs_scale[0]
+                add_amount = min(per_side_amount, net_delta, short_item[3])
+                if add_amount >= self.config.min_trade_notional:
+                    short_qty = add_amount / short_item[4]
+                    actions.append(RebalanceAction(
+                        symbol=short_item[0],
+                        side="SELL",
+                        quantity=short_qty,
+                        notional=add_amount,
+                        reason=f"Scale up SHORT (delta correction) +${add_amount:.0f}"
+                    ))
 
         return actions
 
