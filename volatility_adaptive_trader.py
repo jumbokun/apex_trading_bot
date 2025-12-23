@@ -167,6 +167,16 @@ class ApexTrader:
             return [p for p in positions if float(p.get("size", 0)) != 0]
         return []
 
+    def get_account_balance(self) -> dict:
+        """获取账户余额信息 (totalEquityValue = Margin Balance)"""
+        try:
+            if self.sign_client:
+                result = self.sign_client.get_account_balance_v3()
+                return {"success": True, "data": result.get("data", {})}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+        return {"success": False, "error": "OMNIKEY未配置"}
+
     def _round_size_to_step(self, size: float, symbol: str) -> float:
         try:
             if self.sign_client and hasattr(self.sign_client, 'configV3'):
@@ -235,6 +245,17 @@ class ApexTrader:
             logger.error(f"下单失败: {e}")
             return {"success": False, "error": str(e)}
 
+    def place_market_order(self, symbol: str, side: str, size: float,
+                           reduce_only: bool = False) -> dict:
+        """市价单下单 (用于强制平仓等场景)"""
+        return self.place_order(
+            symbol=symbol,
+            side=side,
+            size=size,
+            order_type="MARKET",
+            reduce_only=reduce_only
+        )
+
     def get_order_status(self, order_id: str) -> Optional[dict]:
         try:
             if self.sign_client:
@@ -261,7 +282,8 @@ class VolatilityAdaptiveTrader:
                  dry_run: bool = True, check_interval: int = 60,
                  rebalance_interval: int = 300,  # 调仓间隔5分钟
                  use_limit_orders: bool = True, price_offset_pct: float = 0.0005,
-                 testnet: bool = True):
+                 testnet: bool = True,
+                 stop_loss_balance: float = 4000.0):  # 强制平仓余额阈值
         self.strategy = strategy
         self.trader = trader
         self.dry_run = dry_run
@@ -271,11 +293,13 @@ class VolatilityAdaptiveTrader:
         self.price_offset_pct = price_offset_pct
         self.testnet = testnet
         self.running = False
+        self.stop_loss_balance = stop_loss_balance  # 强制平仓余额阈值
 
         self.pending_orders: Dict[str, dict] = {}
         self.trades_executed = 0
         self.start_time = None
         self.last_rebalance_check = 0  # 上次调仓检查时间
+        self.last_balance = 0.0  # 上次余额
 
     def sync_positions(self):
         """同步持仓"""
@@ -293,6 +317,84 @@ class VolatilityAdaptiveTrader:
 
             if not found:
                 self.strategy.update_position(symbol, 0, 0)
+
+    def get_balance(self) -> float:
+        """获取账户总权益 (USDT)
+
+        使用 get_account_balance_v3 API 获取 totalEquityValue
+        这就是交易所界面显示的 "Margin Balance"
+        """
+        try:
+            result = self.trader.get_account_balance()
+            if result.get("success"):
+                data = result.get("data", {})
+                total_equity = float(data.get("totalEquityValue", 0))
+                self.last_balance = total_equity
+                return total_equity
+
+        except Exception as e:
+            logger.error(f"获取余额失败: {e}")
+        return self.last_balance  # 返回上次余额
+
+    def check_stop_loss(self) -> bool:
+        """检查是否触发止损线
+
+        Returns:
+            True if stop loss triggered (should close all positions)
+        """
+        if self.dry_run:
+            return False
+
+        balance = self.get_balance()
+        if balance <= 0:
+            return False
+
+        if balance < self.stop_loss_balance:
+            logger.warning(f"[止损触发] 余额 ${balance:.2f} < 止损线 ${self.stop_loss_balance:.2f}")
+            return True
+
+        return False
+
+    def close_all_positions(self):
+        """强制平仓所有持仓"""
+        logger.warning("[强制平仓] 开始平仓所有持仓...")
+
+        self.sync_positions()
+        self.update_prices()
+
+        for symbol, pos in self.strategy.positions.items():
+            if pos.quantity <= 0:
+                continue
+
+            price = self.strategy.prices.get(symbol, 0)
+            if price <= 0:
+                continue
+
+            # 平仓方向：多头卖出，空头买入
+            if pos.side == PositionSide.LONG:
+                side = "SELL"
+            else:
+                side = "BUY"
+
+            logger.warning(f"[强制平仓] {symbol} {side} {pos.quantity:.6f}")
+
+            try:
+                result = self.trader.place_market_order(
+                    symbol=symbol,
+                    side=side,
+                    size=pos.quantity,
+                    reduce_only=True
+                )
+                if result.get("success"):
+                    logger.info(f"[平仓成功] {symbol}")
+                else:
+                    logger.error(f"[平仓失败] {symbol}: {result.get('error')}")
+            except Exception as e:
+                logger.error(f"[平仓异常] {symbol}: {e}")
+
+            time.sleep(0.5)  # 避免频率限制
+
+        logger.warning("[强制平仓] 完成")
 
     def update_prices(self):
         """更新价格"""
@@ -425,9 +527,19 @@ class VolatilityAdaptiveTrader:
 
         return False
 
-    def run_once(self):
-        """运行一次（每分钟调用）"""
+    def run_once(self) -> bool:
+        """运行一次（每分钟调用）
+
+        Returns:
+            False if should stop (stop loss triggered), True otherwise
+        """
         current_time = time.time()
+
+        # 0. 检查止损线
+        if self.check_stop_loss():
+            logger.warning("[止损] 触发止损线，准备强制平仓并终止程序...")
+            self.close_all_positions()
+            return False  # 返回 False 表示应该停止
 
         # 1. 每次都检查挂单状态（每分钟）
         if self.use_limit_orders and not self.dry_run:
@@ -445,10 +557,13 @@ class VolatilityAdaptiveTrader:
         if time_since_last < self.rebalance_interval:
             remaining = self.rebalance_interval - time_since_last
             logger.info(f"[等待] 距下次调仓检查: {remaining:.0f}秒")
-            return
+            return True
 
         # 4. 调仓检查时间到，执行完整检查
         self.last_rebalance_check = current_time
+
+        # 获取余额
+        balance = self.get_balance()
 
         # 获取状态
         status = self.strategy.get_status()
@@ -458,8 +573,8 @@ class VolatilityAdaptiveTrader:
             f"{s}: {v*100:.2f}%" for s, v in status['volatilities'].items()
         ]))
 
-        # 打印仓位状态
-        logger.info(f"[状态] 多头: ${status['total_long']:.0f} | "
+        # 打印仓位状态（增加余额显示）
+        logger.info(f"[状态] 余额: ${balance:.2f} | 多头: ${status['total_long']:.0f} | "
                    f"空头: ${status['total_short']:.0f} | "
                    f"净Delta: ${status['net_delta']:.0f} | "
                    f"目标: ${status['target_exposure']:.0f} | "
@@ -500,6 +615,8 @@ class VolatilityAdaptiveTrader:
 
                 self.strategy.record_rebalance(actions)
 
+        return True  # 正常完成
+
     def run(self):
         """主循环"""
         self.running = True
@@ -514,16 +631,25 @@ class VolatilityAdaptiveTrader:
         logger.info(f"波动率阈值: {self.strategy.config.volatility.vol_low*100:.1f}% ~ {self.strategy.config.volatility.vol_high*100:.1f}%")
         logger.info(f"挂单检查: 每{self.check_interval}秒")
         logger.info(f"调仓间隔: 每{self.rebalance_interval}秒 ({self.rebalance_interval//60}分钟)")
+        logger.info(f"止损余额: ${self.stop_loss_balance:,.0f}")
         logger.info("="*60)
 
         # 初始化波动率
         logger.info("获取初始波动率数据...")
         self.strategy.update_volatility(force=True)
 
+        # 显示初始余额
+        initial_balance = self.get_balance()
+        logger.info(f"初始余额: ${initial_balance:.2f}")
+
         try:
             while self.running:
                 try:
-                    self.run_once()
+                    should_continue = self.run_once()
+                    if should_continue is False:
+                        logger.warning("[止损] 程序因止损触发而终止")
+                        self.running = False
+                        break
                 except Exception as e:
                     logger.error(f"运行错误: {e}")
 
@@ -538,6 +664,10 @@ class VolatilityAdaptiveTrader:
             logger.info("收到停止信号")
             self.running = False
 
+        # 最终状态
+        final_balance = self.get_balance()
+        logger.info(f"最终余额: ${final_balance:.2f}")
+
 
 def main():
     parser = argparse.ArgumentParser(description='波动率自适应交易器')
@@ -546,10 +676,11 @@ def main():
     parser.add_argument('--rebalance-interval', type=int, default=300, help='调仓间隔秒数(默认5分钟)')
     parser.add_argument('--limit-order', action='store_true', help='使用限价单')
     parser.add_argument('--offset', type=float, default=0.05, help='限价单偏移%')
-    parser.add_argument('--min-notional', type=float, default=25000, help='最小单边仓位')
-    parser.add_argument('--max-notional', type=float, default=75000, help='最大单边仓位')
-    parser.add_argument('--vol-low', type=float, default=1.0, help='低波动阈值% (4h)')
-    parser.add_argument('--vol-high', type=float, default=4.0, help='高波动阈值% (4h)')
+    parser.add_argument('--min-notional', type=float, default=10000, help='最小单边仓位')
+    parser.add_argument('--max-notional', type=float, default=50000, help='最大单边仓位')
+    parser.add_argument('--vol-low', type=float, default=1.5, help='低波动阈值% (ATR14)')
+    parser.add_argument('--vol-high', type=float, default=4.0, help='高波动阈值% (ATR14)')
+    parser.add_argument('--stop-loss', type=float, default=4000, help='止损余额阈值(USDT)')
     parser.add_argument('--yes', '-y', action='store_true', help='跳过主网确认')
     args = parser.parse_args()
 
@@ -591,6 +722,8 @@ def main():
     print(f"\n波动率阈值:")
     print(f"  低波动 (<{args.vol_low}%): 满仓 ${config.max_notional*2:,.0f}")
     print(f"  高波动 (>{args.vol_high}%): 低仓 ${config.min_notional*2:,.0f}")
+    print(f"\n风险控制:")
+    print(f"  止损余额: ${args.stop_loss:,.0f} (触发后强制平仓并终止)")
     print(f"\n币种配置:")
     print(f"  多头: {config.long_symbol}")
     print(f"  空头: {', '.join(config.short_symbols)} (按波动率反比分配)")
@@ -627,7 +760,8 @@ def main():
         rebalance_interval=args.rebalance_interval,
         use_limit_orders=args.limit_order,
         price_offset_pct=args.offset / 100,
-        testnet=TESTNET
+        testnet=TESTNET,
+        stop_loss_balance=args.stop_loss
     )
 
     adaptive_trader.run()

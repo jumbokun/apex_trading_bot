@@ -43,17 +43,27 @@ class PositionSide(Enum):
 
 @dataclass
 class VolatilityConfig:
-    """波动率配置"""
-    # 波动率阈值 (4小时波动幅度百分比)
-    # 4h波动率通常在1%~5%之间，需要更敏感的阈值
-    vol_low: float = 0.01    # 1% - 低波动阈值 (满仓)
+    """波动率配置
+
+    使用 ATR (Average True Range) 计算波动率
+    - ATR 是业界标准的波动率指标 (J. Welles Wilder Jr.)
+    - 14 周期是最常用的设置
+    - ATR% = ATR / 收盘价 * 100
+
+    典型的加密货币 ATR% 范围:
+    - 低波动: < 2% (横盘/震荡市)
+    - 中等波动: 2-4% (正常市场)
+    - 高波动: > 4% (趋势/事件驱动)
+    """
+    # ATR% 阈值
+    vol_low: float = 0.015   # 1.5% - 低波动阈值 (满仓)
     vol_high: float = 0.04   # 4% - 高波动阈值 (最低仓)
 
-    # ATR周期
+    # ATR周期 (业界标准14周期)
     atr_period: int = 14
 
-    # 波动率平滑周期 (避免频繁调整)
-    smoothing_period: int = 6  # 6小时移动平均
+    # 使用的K线周期
+    kline_interval: str = "1h"  # 1小时K线
 
 
 @dataclass
@@ -61,8 +71,8 @@ class AdaptiveHedgingConfig:
     """波动率自适应对冲配置"""
 
     # 仓位上下限 (单边)
-    min_notional: float = 25000.0   # 最小单边仓位 25,000U
-    max_notional: float = 75000.0   # 最大单边仓位 75,000U
+    min_notional: float = 10000.0   # 最小单边仓位 10,000U
+    max_notional: float = 50000.0   # 最大单边仓位 50,000U
 
     # 币种配置
     long_symbol: str = "BTC-USDT"   # 多头币种
@@ -120,11 +130,16 @@ class RebalanceAction:
 
 
 class VolatilityCalculator:
-    """波动率计算器"""
+    """波动率计算器 - 使用 ATR (Average True Range)
+
+    ATR 是 J. Welles Wilder Jr. 发明的标准波动率指标。
+    比简单的 (high-low)/close 更准确，因为考虑了跳空缺口。
+    """
 
     def __init__(self):
-        self.price_history: Dict[str, List[dict]] = {}  # symbol -> [{time, open, high, low, close}]
-        self.volatility_cache: Dict[str, Tuple[float, float]] = {}  # symbol -> (volatility, timestamp)
+        self.price_history: Dict[str, List[dict]] = {}
+        # cache: key -> (atr, atr_pct, timestamp)
+        self.volatility_cache: Dict[str, Tuple[float, float, float]] = {}
         self.cache_ttl = 60  # 缓存60秒
 
     def fetch_klines(self, symbol: str, interval: str = "1h", limit: int = 24) -> List[dict]:
@@ -152,56 +167,42 @@ class VolatilityCalculator:
             print(f"获取K线失败 {symbol}: {e}")
             return []
 
-    def calculate_4h_volatility(self, symbol: str) -> float:
-        """计算最近4小时价格波动率
+    def calculate_atr(self, symbol: str, period: int = 14, interval: str = "1h") -> Tuple[float, float]:
+        """计算 ATR (Average True Range) - 业界标准波动率指标
 
-        计算方法: (4小时内最高价 - 4小时内最低价) / 当前价格
-        这更能反映当前市场的实际波动情况
+        ATR 由 J. Welles Wilder Jr. 发明，是衡量市场波动性的标准指标。
+        True Range = max(高-低, |高-前收|, |低-前收|)
+        ATR = True Range 的移动平均
+
+        Args:
+            symbol: 交易对
+            period: ATR周期 (默认14，业界标准)
+            interval: K线周期
+
+        Returns:
+            (ATR绝对值, ATR百分比)
         """
         # 检查缓存
         now = time.time()
-        if symbol in self.volatility_cache:
-            vol, ts = self.volatility_cache[symbol]
+        cache_key = f"{symbol}_{period}_{interval}"
+        if cache_key in self.volatility_cache:
+            atr, atr_pct, ts = self.volatility_cache[cache_key]
             if now - ts < self.cache_ttl:
-                return vol
+                return atr, atr_pct
 
-        # 获取最近4小时的15分钟K线 (16根)
-        klines = self.fetch_klines(symbol, "15m", 16)
-        if not klines:
-            return 0.05  # 默认5%
-
-        # 计算4小时内的最高价和最低价
-        high_4h = max(k['high'] for k in klines)
-        low_4h = min(k['low'] for k in klines)
-        current_close = klines[-1]['close']  # 最新收盘价
-
-        if current_close <= 0:
-            return 0.05
-
-        # 4小时波动率
-        vol_4h = (high_4h - low_4h) / current_close
-
-        # 缓存结果
-        self.volatility_cache[symbol] = (vol_4h, now)
-
-        return vol_4h
-
-    def calculate_24h_volatility(self, symbol: str) -> float:
-        """计算24小时波动率 (向后兼容)"""
-        return self.calculate_4h_volatility(symbol)
-
-    def calculate_atr(self, symbol: str, period: int = 14) -> float:
-        """计算ATR (Average True Range)"""
-        klines = self.fetch_klines(symbol, "1h", period + 1)
+        # 获取 K 线数据 (需要 period+1 根来计算 period 个 TR)
+        klines = self.fetch_klines(symbol, interval, period + 1)
         if len(klines) < period + 1:
-            return 0.0
+            return 0.0, 0.05
 
+        # 计算 True Range
         true_ranges = []
         for i in range(1, len(klines)):
             high = klines[i]['high']
             low = klines[i]['low']
             prev_close = klines[i-1]['close']
 
+            # True Range = max(高-低, |高-前收|, |低-前收|)
             tr = max(
                 high - low,
                 abs(high - prev_close),
@@ -209,7 +210,30 @@ class VolatilityCalculator:
             )
             true_ranges.append(tr)
 
-        return sum(true_ranges[-period:]) / period
+        # ATR = TR 的简单移动平均
+        atr = sum(true_ranges[-period:]) / period
+
+        # ATR% = ATR / 当前价格
+        current_price = klines[-1]['close']
+        atr_pct = atr / current_price if current_price > 0 else 0.05
+
+        # 缓存结果
+        self.volatility_cache[cache_key] = (atr, atr_pct, now)
+
+        return atr, atr_pct
+
+    def calculate_volatility(self, symbol: str, period: int = 14, interval: str = "1h") -> float:
+        """计算波动率 (ATR%)
+
+        返回 ATR 百分比，用于仓位计算
+        """
+        _, atr_pct = self.calculate_atr(symbol, period, interval)
+        return atr_pct
+
+    # 向后兼容的别名
+    def calculate_24h_volatility(self, symbol: str) -> float:
+        """计算波动率 (使用ATR14)"""
+        return self.calculate_volatility(symbol, period=14)
 
     def get_volatility_score(self, symbol: str, config: VolatilityConfig) -> float:
         """获取波动率评分 (0-1)
@@ -604,9 +628,13 @@ class VolatilityAdaptiveStrategy:
 
 # 测试
 if __name__ == "__main__":
+    print("=" * 60)
+    print("波动率自适应策略 - ATR 测试")
+    print("=" * 60)
+
     config = AdaptiveHedgingConfig(
-        min_notional=25000.0,
-        max_notional=75000.0,
+        min_notional=10000.0,
+        max_notional=50000.0,
         long_symbol="BTC-USDT",
         short_symbols=["ETH-USDT", "SOL-USDT"]
     )
@@ -618,12 +646,36 @@ if __name__ == "__main__":
     strategy.update_price("ETH-USDT", 3300.0)
     strategy.update_price("SOL-USDT", 180.0)
 
+    # 测试 ATR 计算
+    print("\n正在计算 ATR(14) 波动率...")
+    print("-" * 40)
+
+    vol_calc = strategy.vol_calc
+    symbols = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
+
+    for symbol in symbols:
+        atr, atr_pct = vol_calc.calculate_atr(symbol, period=14, interval="1h")
+        price = strategy.prices.get(symbol, 0)
+        print(f"{symbol}:")
+        print(f"  价格: ${price:,.0f}")
+        print(f"  ATR(14): ${atr:,.2f}")
+        print(f"  ATR%: {atr_pct*100:.2f}%")
+
     # 更新波动率
-    print("正在获取波动率数据...")
+    print("\n" + "-" * 40)
     vols = strategy.update_volatility(force=True)
-    print(f"\n波动率:")
-    for symbol, vol in vols.items():
-        print(f"  {symbol}: {vol*100:.2f}%")
+
+    # 波动率阈值
+    print(f"\n波动率阈值配置:")
+    print(f"  低波动 (满仓): < {config.volatility.vol_low*100:.1f}%")
+    print(f"  高波动 (最低仓): > {config.volatility.vol_high*100:.1f}%")
+
+    # 波动率评分
+    print(f"\n波动率评分:")
+    for symbol in symbols:
+        vol = vols.get(symbol, 0)
+        score = vol_calc.get_volatility_score(symbol, config.volatility)
+        print(f"  {symbol}: ATR% {vol*100:.2f}% -> 评分 {score:.2f}")
 
     # 计算目标仓位
     total, targets = strategy.calculate_target_notional()
