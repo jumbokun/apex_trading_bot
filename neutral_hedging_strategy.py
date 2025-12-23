@@ -54,12 +54,12 @@ class HedgingConfig:
     """中性对冲策略配置"""
 
     # 资产配置 - 默认: BTC多/ETH空/SOL空
-    # 目标总仓位: 100,000U (多头50,000U + 空头50,000U)
-    # BTC多头50,000U vs ETH空头25,000U + SOL空头25,000U
+    # 目标总仓位: 150,000U (多头75,000U + 空头75,000U)
+    # BTC多头75,000U vs ETH空头37,500U + SOL空头37,500U
     assets: List[AssetConfig] = field(default_factory=lambda: [
-        AssetConfig("BTC-USDT", PositionSide.LONG, 50000.0, weight=1.0),
-        AssetConfig("ETH-USDT", PositionSide.SHORT, 25000.0, weight=1.0),
-        AssetConfig("SOL-USDT", PositionSide.SHORT, 25000.0, weight=1.0),
+        AssetConfig("BTC-USDT", PositionSide.LONG, 75000.0, weight=1.0),
+        AssetConfig("ETH-USDT", PositionSide.SHORT, 37500.0, weight=1.0),
+        AssetConfig("SOL-USDT", PositionSide.SHORT, 37500.0, weight=1.0),
     ])
 
     # 杠杆
@@ -77,8 +77,8 @@ class HedgingConfig:
     min_trade_notional: float = 100.0  # 最小交易金额
 
     # 风险控制
-    max_single_position_notional: float = 60000.0  # 单仓位上限
-    max_total_exposure: float = 120000.0  # 总敞口上限
+    max_single_position_notional: float = 80000.0  # 单仓位上限
+    max_total_exposure: float = 160000.0  # 总敞口上限
     emergency_delta_pct: float = 0.10  # 紧急Delta阈值（10%触发强制调仓）
 
     # 模式

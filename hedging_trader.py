@@ -750,11 +750,11 @@ class HedgingTrader:
 
         return actions
 
-    def check_pending_orders(self, max_wait_seconds: int = 30):
+    def check_pending_orders(self, max_wait_seconds: int = 15):
         """检查挂单状态，超时未成交则取消并以更接近市价的价格重挂
 
         Args:
-            max_wait_seconds: 最大等待时间，超过则取消订单并重挂
+            max_wait_seconds: 最大等待时间，超过则取消订单并重挂（默认15秒）
         """
         if not self.pending_orders or self.dry_run:
             return
@@ -805,21 +805,41 @@ class HedgingTrader:
                 if order_id in self.pending_orders:
                     del self.pending_orders[order_id]
 
+                retry_count = order_info.get("retry_count", 0) + 1
+
+                # 重试超过3次，直接用市价单确保成交
+                if retry_count > 3:
+                    logger.warning(f"[市价成交] {order_info['symbol']} 重试{retry_count}次失败，改用市价单")
+                    result = self.trader.place_order(
+                        symbol=order_info["symbol"],
+                        side=order_info["side"],
+                        size=order_info["quantity"],
+                        order_type="MARKET"
+                    )
+                    if result.get("success"):
+                        logger.info(f"[市价成交] {order_info['symbol']} {order_info['side']} 成功")
+                    else:
+                        logger.error(f"[市价失败] {order_info['symbol']}: {result.get('error')}")
+                    continue
+
                 # 2. 获取最新价格
                 current_price = fetch_binance_price(order_info["symbol"])
                 if current_price and current_price > 0:
-                    # 3. 计算新的挂单价格（每次重试减小偏移量，更接近市价）
-                    retry_count = order_info.get("retry_count", 0) + 1
-                    # 偏移量逐步减小：第1次0.05%, 第2次0.03%, 第3次0.01%, 第4次及以后0.005%
-                    offset_factor = max(0.1, 1.0 - retry_count * 0.3)  # 1.0, 0.7, 0.4, 0.1...
-                    adjusted_offset = self.price_offset_pct * offset_factor
+                    # 3. 计算新的挂单价格（每次重试更接近市价）
+                    # 第1次: 0.03%, 第2次: 0.01%, 第3次: 0.005%
+                    if retry_count == 1:
+                        adjusted_offset = 0.0003  # 0.03%
+                    elif retry_count == 2:
+                        adjusted_offset = 0.0001  # 0.01%
+                    else:
+                        adjusted_offset = 0.00005  # 0.005%
 
                     if order_info["side"] == "BUY":
                         new_price = current_price * (1 - adjusted_offset)
                     else:
                         new_price = current_price * (1 + adjusted_offset)
 
-                    logger.info(f"[重挂] {order_info['symbol']} 偏移调整: {self.price_offset_pct*100:.3f}% -> {adjusted_offset*100:.3f}%")
+                    logger.info(f"[重挂] {order_info['symbol']} 偏移: {adjusted_offset*100:.3f}% (第{retry_count}次)")
 
                     # 4. 重新挂单
                     result = self.trader.place_order(
@@ -840,7 +860,7 @@ class HedgingTrader:
                             "price": new_price,
                             "notional": order_info["notional"],
                             "time": time.time(),
-                            "retry_count": retry_count  # 记录重试次数
+                            "retry_count": retry_count
                         }
                     else:
                         logger.error(f"[重挂失败] {order_info['symbol']}: {result.get('error')}")
@@ -924,7 +944,7 @@ class HedgingTrader:
         """运行一次检查和调仓"""
         # 0. 检查挂单状态（限价单模式）
         if self.use_limit_orders and not self.dry_run:
-            self.check_pending_orders(max_wait_seconds=60)
+            self.check_pending_orders(max_wait_seconds=15)
 
         # 1. 更新价格
         self.update_prices()
@@ -1094,14 +1114,14 @@ def main():
     PRE_SETTLEMENT_MINUTES = args.pre_settlement
 
     # 策略配置
-    # 目标: 100,000U 总仓位 (多头50,000U + 空头50,000U) = Delta中性
-    # BTC多$50000 vs ETH空$25000 + SOL空$25000
+    # 目标: 150,000U 总仓位 (多头75,000U + 空头75,000U) = Delta中性
+    # BTC多$75000 vs ETH空$37500 + SOL空$37500
     # 每次加仓2000U（多头1000U + 空头各500U），1分钟一次
     config = HedgingConfig(
         assets=[
-            AssetConfig("BTC-USDT", PositionSide.LONG, 50000.0),
-            AssetConfig("ETH-USDT", PositionSide.SHORT, 25000.0),
-            AssetConfig("SOL-USDT", PositionSide.SHORT, 25000.0),
+            AssetConfig("BTC-USDT", PositionSide.LONG, 75000.0),
+            AssetConfig("ETH-USDT", PositionSide.SHORT, 37500.0),
+            AssetConfig("SOL-USDT", PositionSide.SHORT, 37500.0),
         ],
         leverage=3,
         rebalance_interval_seconds=60,  # 1分钟检查一次
@@ -1125,7 +1145,7 @@ def main():
     if DYNAMIC_FUNDING:
         print(f"费率检查间隔: {args.funding_interval}分钟")
         print(f"结算前检查: 提前{PRE_SETTLEMENT_MINUTES}分钟")
-    print(f"\n目标配置 (总仓位: $100,000):")
+    print(f"\n目标配置 (总仓位: $150,000):")
     total_long = sum(a.target_notional for a in config.assets if a.side == PositionSide.LONG)
     total_short = sum(a.target_notional for a in config.assets if a.side == PositionSide.SHORT)
     for asset in config.assets:
@@ -1136,7 +1156,7 @@ def main():
     print(f"\n加仓策略:")
     print(f"  每次加仓: ${config.scale_up_amount:,.0f} (多头${config.scale_up_amount/2:,.0f} + 空头${config.scale_up_amount/2:,.0f})")
     print(f"  加仓间隔: {config.rebalance_interval_seconds}秒 (1分钟)")
-    print(f"  预计达到目标: ~{int(100000 / config.scale_up_amount)}分钟 (~{int(100000 / config.scale_up_amount / 60)}小时)")
+    print(f"  预计达到目标: ~{int(150000 / config.scale_up_amount)}分钟 (~{int(150000 / config.scale_up_amount / 60)}小时)")
     print(f"\n风控参数:")
     print(f"  Delta偏差阈值: {config.delta_threshold_pct:.0%}")
     print(f"  最小交易额: ${config.min_trade_notional:.0f}")
