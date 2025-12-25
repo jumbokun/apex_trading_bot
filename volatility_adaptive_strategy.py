@@ -72,7 +72,7 @@ class AdaptiveHedgingConfig:
 
     # 仓位上下限 (单边)
     min_notional: float = 10000.0   # 最小单边仓位 10,000U
-    max_notional: float = 50000.0   # 最大单边仓位 50,000U
+    max_notional: float = 45000.0   # 最大单边仓位 45,000U
 
     # 币种配置
     long_symbol: str = "BTC-USDT"   # 多头币种
@@ -91,8 +91,8 @@ class AdaptiveHedgingConfig:
     min_trade_notional: float = 100.0
 
     # Delta中性阈值
-    delta_threshold_pct: float = 0.03      # 3%偏差触发
-    emergency_delta_pct: float = 0.10      # 10%紧急调仓
+    delta_threshold_pct: float = 0.005     # 0.5%偏差触发 (约$150 @ 30k单边)
+    emergency_delta_pct: float = 0.03      # 3%紧急调仓
 
     # 波动率检查间隔
     volatility_check_interval: int = 300   # 5分钟检查一次波动率
@@ -549,7 +549,33 @@ class VolatilityAdaptiveStrategy:
                         reason=f"减仓 SHORT (波动率调整)"
                     ))
 
-        # 处理Delta不平衡 (只需要单边调整)
+        # 处理单边调整 (只有一边需要调整)
+        # 允许空头之间重新分配 (一个加一个减)
+        elif short_scale_up and short_scale_down:
+            # 空头内部重新平衡 (例如 ETH 加仓 + SOL 减仓)
+            for up_item in short_scale_up:
+                add = min(max_adjust / 2, up_item[4])
+                if add >= self.config.min_trade_notional:
+                    qty = add / up_item[5]
+                    actions.append(RebalanceAction(
+                        symbol=up_item[0],
+                        side="SELL",
+                        quantity=qty,
+                        notional=add,
+                        reason=f"空头重平衡 (加仓)"
+                    ))
+            for down_item in short_scale_down:
+                reduce = min(max_adjust / 2, abs(down_item[4]))
+                if reduce >= self.config.min_trade_notional:
+                    qty = reduce / down_item[5]
+                    actions.append(RebalanceAction(
+                        symbol=down_item[0],
+                        side="BUY",
+                        quantity=qty,
+                        notional=reduce,
+                        reason=f"空头重平衡 (减仓)"
+                    ))
+
         elif long_scale_up and not short_scale_up:
             # 只有多头需要加，检查是否偏空
             total_long, total_short, net_delta = self.get_portfolio_delta()

@@ -677,7 +677,7 @@ def main():
     parser.add_argument('--limit-order', action='store_true', help='使用限价单')
     parser.add_argument('--offset', type=float, default=0.05, help='限价单偏移%')
     parser.add_argument('--min-notional', type=float, default=10000, help='最小单边仓位')
-    parser.add_argument('--max-notional', type=float, default=50000, help='最大单边仓位')
+    parser.add_argument('--max-notional', type=float, default=45000, help='最大单边仓位')
     parser.add_argument('--vol-low', type=float, default=1.5, help='低波动阈值% (ATR14)')
     parser.add_argument('--vol-high', type=float, default=4.0, help='高波动阈值% (ATR14)')
     parser.add_argument('--stop-loss', type=float, default=4000, help='止损余额阈值(USDT)')
@@ -707,7 +707,7 @@ def main():
         rebalance_interval_seconds=60,
         scale_amount=2000.0,
         min_trade_notional=100.0,
-        delta_threshold_pct=0.03,
+        delta_threshold_pct=0.005,
         volatility_check_interval=300
     )
 
