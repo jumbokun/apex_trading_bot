@@ -24,7 +24,7 @@ from typing import Dict, List, Optional
 
 from volatility_adaptive_strategy import (
     VolatilityAdaptiveStrategy, AdaptiveHedgingConfig,
-    VolatilityConfig, PositionSide, RebalanceAction
+    VolatilityConfig, PositionSide, RebalanceAction, WeightMode
 )
 
 # 设置日志 - 保存在项目目录的logs子目录
@@ -562,8 +562,9 @@ class VolatilityAdaptiveTrader:
         # 4. 调仓检查时间到，执行完整检查
         self.last_rebalance_check = current_time
 
-        # 获取余额
+        # 获取余额并更新策略（用于杠杆限制）
         balance = self.get_balance()
+        self.strategy.update_balance(balance)
 
         # 获取状态
         status = self.strategy.get_status()
@@ -580,11 +581,12 @@ class VolatilityAdaptiveTrader:
                    f"目标: ${status['target_exposure']:.0f} | "
                    f"偏差: {status['imbalance_pct']:.1%}")
 
-        # 打印各仓位详情
+        # 打印各仓位详情 (包含Beta值)
         for pos in status['positions']:
+            beta_str = f" | Beta: {pos.get('beta', 1.0):.2f}" if pos['side'] == 'SHORT' else ""
             logger.info(f"  {pos['symbol']}: {pos['side']} "
                        f"${pos['current_notional']:.0f} / ${pos['target_notional']:.0f} "
-                       f"({pos['fill_pct']:.0f}%) | 波动率: {pos['volatility']*100:.2f}%")
+                       f"({pos['fill_pct']:.0f}%) | 波动率: {pos['volatility']*100:.2f}%{beta_str}")
 
         # 检查是否需要调仓
         should, reason = self.strategy.should_rebalance()
@@ -629,6 +631,8 @@ class VolatilityAdaptiveTrader:
         logger.info(f"订单类型: {'限价单' if self.use_limit_orders else '市价单'}")
         logger.info(f"仓位范围: ${self.strategy.config.min_notional:,.0f} ~ ${self.strategy.config.max_notional:,.0f}")
         logger.info(f"波动率阈值: {self.strategy.config.volatility.vol_low*100:.1f}% ~ {self.strategy.config.volatility.vol_high*100:.1f}%")
+        weight_mode_desc = "Beta反比(P&L平衡)" if self.strategy.config.weight_mode == "beta" else "波动率反比"
+        logger.info(f"空头分配: {weight_mode_desc}")
         logger.info(f"挂单检查: 每{self.check_interval}秒")
         logger.info(f"调仓间隔: 每{self.rebalance_interval}秒 ({self.rebalance_interval//60}分钟)")
         logger.info(f"止损余额: ${self.stop_loss_balance:,.0f}")
@@ -638,9 +642,11 @@ class VolatilityAdaptiveTrader:
         logger.info("获取初始波动率数据...")
         self.strategy.update_volatility(force=True)
 
-        # 显示初始余额
+        # 显示初始余额并更新策略（用于杠杆限制）
         initial_balance = self.get_balance()
+        self.strategy.update_balance(initial_balance)
         logger.info(f"初始余额: ${initial_balance:.2f}")
+        logger.info(f"杠杆限制: 单边最大 ${initial_balance * self.strategy.max_leverage:,.0f} (余额x{self.strategy.max_leverage:.0f})")
 
         try:
             while self.running:
@@ -673,13 +679,15 @@ def main():
     parser = argparse.ArgumentParser(description='波动率自适应交易器')
     parser.add_argument('--dry-run', action='store_true', help='模拟模式')
     parser.add_argument('--interval', type=int, default=60, help='挂单检查间隔秒数')
-    parser.add_argument('--rebalance-interval', type=int, default=300, help='调仓间隔秒数(默认5分钟)')
+    parser.add_argument('--rebalance-interval', type=int, default=900, help='调仓间隔秒数(默认15分钟)')
     parser.add_argument('--limit-order', action='store_true', help='使用限价单')
     parser.add_argument('--offset', type=float, default=0.05, help='限价单偏移%')
     parser.add_argument('--min-notional', type=float, default=10000, help='最小单边仓位')
-    parser.add_argument('--max-notional', type=float, default=45000, help='最大单边仓位')
-    parser.add_argument('--vol-low', type=float, default=1.5, help='低波动阈值% (ATR14)')
-    parser.add_argument('--vol-high', type=float, default=4.0, help='高波动阈值% (ATR14)')
+    parser.add_argument('--max-notional', type=float, default=60000, help='最大单边仓位')
+    parser.add_argument('--vol-low', type=float, default=0.4, help='低波动阈值% (ATR14)')
+    parser.add_argument('--vol-high', type=float, default=1.2, help='高波动阈值% (ATR14)')
+    parser.add_argument('--weight-mode', type=str, default='beta', choices=['beta', 'volatility'],
+                       help='空头权重分配模式: beta(P&L平衡) 或 volatility(波动率反比)')
     parser.add_argument('--stop-loss', type=float, default=4000, help='止损余额阈值(USDT)')
     parser.add_argument('--yes', '-y', action='store_true', help='跳过主网确认')
     args = parser.parse_args()
@@ -703,6 +711,7 @@ def main():
             vol_low=args.vol_low / 100,
             vol_high=args.vol_high / 100
         ),
+        weight_mode=args.weight_mode,  # beta 或 volatility
         leverage=3,
         rebalance_interval_seconds=60,
         scale_amount=2000.0,

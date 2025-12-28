@@ -69,12 +69,6 @@ class VolatilityConfig:
     kline_interval: str = "1h"  # 1小时K线
 
 
-class WeightMode:
-    """空头权重分配模式"""
-    VOLATILITY = "volatility"  # 波动率反比 (原方案)
-    BETA = "beta"              # Beta反比 (P&L平衡优化)
-
-
 @dataclass
 class AdaptiveHedgingConfig:
     """波动率自适应对冲配置"""
@@ -89,11 +83,6 @@ class AdaptiveHedgingConfig:
 
     # 波动率配置
     volatility: VolatilityConfig = field(default_factory=VolatilityConfig)
-
-    # 空头权重分配模式
-    # "volatility": 波动率反比 - 高波动币种权重低
-    # "beta": Beta反比 - 高Beta币种权重低 (P&L更平衡)
-    weight_mode: str = "beta"  # 默认使用Beta模式
 
     # 杠杆
     leverage: int = 3
@@ -144,25 +133,17 @@ class RebalanceAction:
 
 
 class VolatilityCalculator:
-    """波动率计算器 - 使用 ATR (Average True Range) 和 Beta
+    """波动率计算器 - 使用 ATR (Average True Range)
 
     ATR 是 J. Welles Wilder Jr. 发明的标准波动率指标。
     比简单的 (high-low)/close 更准确，因为考虑了跳空缺口。
-
-    Beta 衡量某币种相对于BTC的涨跌倍数：
-    - Beta > 1: 涨跌幅比BTC大
-    - Beta < 1: 涨跌幅比BTC小
-    - Beta = 1: 与BTC同步
     """
 
     def __init__(self):
         self.price_history: Dict[str, List[dict]] = {}
         # cache: key -> (atr, atr_pct, timestamp)
         self.volatility_cache: Dict[str, Tuple[float, float, float]] = {}
-        # beta cache: key -> (beta, timestamp)
-        self.beta_cache: Dict[str, Tuple[float, float]] = {}
         self.cache_ttl = 60  # 缓存60秒
-        self.beta_cache_ttl = 300  # Beta缓存5分钟（计算量大）
 
     def fetch_klines(self, symbol: str, interval: str = "1h", limit: int = 24) -> List[dict]:
         """从Binance获取K线数据"""
@@ -272,110 +253,9 @@ class VolatilityCalculator:
         else:
             return (vol - config.vol_low) / (config.vol_high - config.vol_low)
 
-    def calculate_beta(self, symbol: str, base_symbol: str = "BTC-USDT",
-                       period: int = 24, interval: str = "1h") -> float:
-        """计算Beta - 某币种相对于基准币种(BTC)的涨跌倍数
-
-        Beta = Cov(R_symbol, R_base) / Var(R_base)
-
-        如果 Beta = 1.2，表示BTC涨1%时，该币种平均涨1.2%
-
-        Args:
-            symbol: 目标币种
-            base_symbol: 基准币种 (默认BTC)
-            period: 计算周期数
-            interval: K线周期
-
-        Returns:
-            Beta值 (默认1.0)
-        """
-        # 如果是基准币种本身，Beta = 1
-        if symbol == base_symbol:
-            return 1.0
-
-        # 检查缓存
-        now = time.time()
-        cache_key = f"{symbol}_{base_symbol}_{period}_{interval}"
-        if cache_key in self.beta_cache:
-            beta, ts = self.beta_cache[cache_key]
-            if now - ts < self.beta_cache_ttl:
-                return beta
-
-        try:
-            # 获取两个币种的K线数据
-            klines_symbol = self.fetch_klines(symbol, interval, period + 1)
-            klines_base = self.fetch_klines(base_symbol, interval, period + 1)
-
-            if len(klines_symbol) < period + 1 or len(klines_base) < period + 1:
-                return 1.0
-
-            # 计算收益率序列
-            returns_symbol = []
-            returns_base = []
-
-            for i in range(1, min(len(klines_symbol), len(klines_base))):
-                # 收益率 = (close - prev_close) / prev_close
-                r_symbol = (klines_symbol[i]['close'] - klines_symbol[i-1]['close']) / klines_symbol[i-1]['close']
-                r_base = (klines_base[i]['close'] - klines_base[i-1]['close']) / klines_base[i-1]['close']
-                returns_symbol.append(r_symbol)
-                returns_base.append(r_base)
-
-            if len(returns_symbol) < 2:
-                return 1.0
-
-            # 计算均值
-            mean_symbol = sum(returns_symbol) / len(returns_symbol)
-            mean_base = sum(returns_base) / len(returns_base)
-
-            # 计算协方差和方差
-            # Cov(X,Y) = E[(X-μx)(Y-μy)]
-            # Var(X) = E[(X-μx)²]
-            cov = 0.0
-            var_base = 0.0
-
-            for i in range(len(returns_symbol)):
-                diff_symbol = returns_symbol[i] - mean_symbol
-                diff_base = returns_base[i] - mean_base
-                cov += diff_symbol * diff_base
-                var_base += diff_base * diff_base
-
-            cov /= len(returns_symbol)
-            var_base /= len(returns_base)
-
-            # Beta = Cov / Var
-            if var_base > 0:
-                beta = cov / var_base
-            else:
-                beta = 1.0
-
-            # 限制Beta范围 (0.5 ~ 2.5)，避免极端值
-            beta = max(0.5, min(2.5, beta))
-
-            # 缓存结果
-            self.beta_cache[cache_key] = (beta, now)
-
-            return beta
-
-        except Exception as e:
-            print(f"计算Beta失败 {symbol}: {e}")
-            return 1.0
-
-    def get_all_betas(self, symbols: List[str], base_symbol: str = "BTC-USDT") -> Dict[str, float]:
-        """获取多个币种的Beta值"""
-        betas = {}
-        for symbol in symbols:
-            betas[symbol] = self.calculate_beta(symbol, base_symbol)
-        return betas
-
 
 class VolatilityAdaptiveStrategy:
-    """波动率自适应Delta中性策略 (Beta加权版本)
-
-    使用Beta加权分配空头仓位，使P&L更平衡：
-    - Beta高的币种（相对BTC波动大）分配更少仓位
-    - Beta低的币种分配更多仓位
-    - 目标：空头P&L变化 ≈ 多头P&L变化
-    """
+    """波动率自适应Delta中性策略"""
 
     def __init__(self, config: AdaptiveHedgingConfig = None):
         self.config = config or AdaptiveHedgingConfig()
@@ -384,16 +264,11 @@ class VolatilityAdaptiveStrategy:
         self.positions: Dict[str, Position] = {}
         self.prices: Dict[str, float] = {}
         self.volatilities: Dict[str, float] = {}
-        self.betas: Dict[str, float] = {}  # Beta值存储
 
         self.last_volatility_check = 0
         self.last_rebalance_time = 0
         self.rebalance_count = 0
         self.total_volume = 0.0
-
-        # 余额和杠杆限制
-        self.current_balance: float = 0.0
-        self.max_leverage: float = 10.0  # 最大单边仓位 = 余额 * 10
 
         # 初始化持仓
         self._init_positions()
@@ -425,12 +300,8 @@ class VolatilityAdaptiveStrategy:
             self.positions[symbol].quantity = quantity
             self.positions[symbol].avg_price = avg_price
 
-    def update_balance(self, balance: float):
-        """更新账户余额 (用于杠杆限制计算)"""
-        self.current_balance = balance
-
     def update_volatility(self, force: bool = False) -> Dict[str, float]:
-        """更新波动率和Beta数据
+        """更新波动率数据
 
         Returns:
             {symbol: volatility} 字典
@@ -451,27 +322,15 @@ class VolatilityAdaptiveStrategy:
             if symbol in self.positions:
                 self.positions[symbol].current_volatility = vol
 
-        # 计算空头币种的Beta值
-        for symbol in self.config.short_symbols:
-            beta = self.vol_calc.calculate_beta(symbol, self.config.long_symbol)
-            self.betas[symbol] = beta
-
-        # 多头币种Beta = 1
-        self.betas[self.config.long_symbol] = 1.0
-
         return self.volatilities
 
     def calculate_target_notional(self) -> Tuple[float, Dict[str, float]]:
         """根据波动率计算目标仓位
 
-        空头分配模式由 config.weight_mode 决定：
-        - "volatility": 波动率反比加权 (高波动币种权重低)
-        - "beta": Beta反比加权 (P&L平衡优化，高Beta币种权重低)
-
         Returns:
             (总目标仓位, {symbol: 目标仓位})
         """
-        # 更新波动率和Beta
+        # 更新波动率
         self.update_volatility()
 
         # 计算整体市场波动率 (取BTC波动率作为基准)
@@ -488,40 +347,27 @@ class VolatilityAdaptiveStrategy:
             self.config.max_notional - self.config.min_notional
         )
 
-        # 杠杆限制：单边仓位不能超过余额的max_leverage倍
-        if self.current_balance > 0:
-            max_allowed = self.current_balance * self.max_leverage
-            if target_per_side > max_allowed:
-                target_per_side = max_allowed
-
         targets = {}
 
         # 多头目标
         targets[self.config.long_symbol] = target_per_side
 
-        # 空头目标 - 根据weight_mode选择分配方式
-        if self.config.weight_mode == WeightMode.BETA:
-            # Beta反比加权 (P&L平衡优化)
-            # Beta高 → 涨跌幅大 → 需要更少仓位来匹配BTC的P&L
-            short_weights = {}
-            for symbol in self.config.short_symbols:
-                beta = self.betas.get(symbol, 1.0)
-                short_weights[symbol] = 1.0 / beta if beta > 0 else 1.0
-
-        else:
-            # 波动率反比加权 (原方案)
-            # 波动率高 → 权重低
-            short_weights = {}
-            for symbol in self.config.short_symbols:
-                vol = self.volatilities.get(symbol, 0.05)
-                short_weights[symbol] = 1.0 / vol if vol > 0 else 1.0
-
-        # 归一化权重并计算目标仓位
-        total_weight = sum(short_weights.values())
+        # 空头目标 - 按波动率反比分配
+        short_vols = {}
         for symbol in self.config.short_symbols:
-            if total_weight > 0:
-                weight = short_weights[symbol] / total_weight
+            short_vols[symbol] = self.volatilities.get(symbol, 0.05)
+
+        # 计算反比权重
+        # 波动率越高，权重越低
+        total_inverse_vol = sum(1/v for v in short_vols.values() if v > 0)
+
+        for symbol in self.config.short_symbols:
+            vol = short_vols.get(symbol, 0.05)
+            if vol > 0 and total_inverse_vol > 0:
+                # 反比权重
+                weight = (1/vol) / total_inverse_vol
             else:
+                # 平均分配
                 weight = 1.0 / len(self.config.short_symbols)
 
             targets[symbol] = target_per_side * weight
@@ -792,7 +638,6 @@ class VolatilityAdaptiveStrategy:
                 "current_notional": pos.get_notional(price),
                 "target_notional": target,
                 "volatility": self.volatilities.get(symbol, 0),
-                "beta": self.betas.get(symbol, 1.0),  # 添加Beta值
                 "fill_pct": pos.get_notional(price) / target * 100 if target > 0 else 0
             })
 
@@ -806,8 +651,7 @@ class VolatilityAdaptiveStrategy:
             "rebalance_count": self.rebalance_count,
             "total_volume": self.total_volume,
             "positions": positions_detail,
-            "volatilities": self.volatilities,
-            "betas": self.betas  # 添加Beta值
+            "volatilities": self.volatilities
         }
 
 
